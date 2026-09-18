@@ -245,6 +245,12 @@ func (s *Scheduler) process(t *Task, user *User) {
 	// 模块4/5：按该账号所属学校的规则来跑（抢座时刻 / 放号方式 / 单段最大小时 / 是否整段约满）
 	rule := user.schoolRule()
 
+	// 手动时间段任务：只约用户自己指定的那几个时间段（不接力、不自动续）
+	if t.Type == "manual" {
+		s.doManual(c, t, rule)
+		return
+	}
+
 	// 校验闭馆时间
 	if t.CapEnd == "" {
 		if capEnd, err := c.RoomCapEnd(t.RoomID); err == nil {
@@ -529,8 +535,142 @@ func (s *Scheduler) doDaily(c *CXClient, t *Task, dayOffset int, startTime strin
 	s.setTask(t, fmt.Sprintf("已预约至 %s，等待签到", coverageEnd.Format("01-02 15:04")), true)
 }
 
-// handleSign 处理待签到预约。
-// 签到窗口 = [开始前 20 分钟, 开始后 20 分钟]（多数学校的 preSignDuration 是 30 分钟，取 20 更稳）。
+// doManual 手动时间段任务：只约用户指定的那几个时间段。
+// 与自动引擎的区别：不维护连续时间线、不接力、不自动续约，约到就停（每轮只补齐"还没约上的段"）。
+// 目标日按 mode：today_once(今天) / tomorrow_once(明天) / both(每天都要这些段)。
+func (s *Scheduler) doManual(c *CXClient, t *Task, rule schoolRule) {
+	now := time.Now()
+	segs := t.manualSegments()
+	if len(segs) == 0 {
+		s.setTask(t, "手动时间段任务没有设置时间段", false)
+		return
+	}
+	seats := t.seatCandidates()
+	if len(seats) == 0 {
+		s.setTask(t, "任务未指定座位", false)
+		return
+	}
+
+	cur, near, _ := c.MyReserves(t.SeatID)
+	all := append(append([]ReserveInfo{}, cur...), near...)
+	var mine []ReserveInfo
+	for _, r := range all {
+		if r.RoomIDStr() == t.RoomID && activeReserve(r) {
+			mine = append(mine, r)
+		}
+	}
+	s.handleSign(c, t, mine)
+
+	todayMid := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	var days []time.Time
+	switch t.Mode {
+	case "tomorrow_once":
+		days = []time.Time{todayMid.AddDate(0, 0, 1)}
+	case "both":
+		days = []time.Time{todayMid, todayMid.AddDate(0, 0, 1)}
+	default:
+		days = []time.Time{todayMid}
+	}
+
+	booked, skipped := 0, 0
+	var firstErr error
+	var waitUntil time.Time
+	for _, day := range days {
+		openAt := rule.windowOpenAt(day)
+		if now.Before(openAt) {
+			if wait := time.Until(openAt); wait > 0 && wait <= urgentBefore {
+				// 快到放号点了：精确等到放号时刻再提交
+				log.Printf("[手动] task=%d 精确等待放号时刻 %s（还有 %.1fs）", t.ID, openAt.Format("15:04:05"), wait.Seconds())
+				time.Sleep(wait)
+				now = time.Now()
+			} else {
+				if waitUntil.IsZero() || openAt.Before(waitUntil) {
+					waitUntil = openAt
+				}
+				continue
+			}
+		}
+		capEnd := s.capEndFor(c, t, day, rule)
+		capTime, _ := rule.capTimeOn(day, capEnd)
+		roomOpen, _ := parseHM(c.RoomOpenAt(t.RoomID, day))
+
+		for _, seg := range segs {
+			st, e1 := parseHM(seg.Start)
+			en, e2 := parseHM(seg.End)
+			if e1 != nil || e2 != nil {
+				skipped++
+				continue
+			}
+			segStart := time.Date(day.Year(), day.Month(), day.Day(), st.Hour(), st.Minute(), 0, 0, day.Location())
+			segEnd := time.Date(day.Year(), day.Month(), day.Day(), en.Hour(), en.Minute(), 0, 0, day.Location())
+			// 闭馆封顶
+			if segEnd.After(capTime) {
+				segEnd = capTime
+			}
+			// 未开馆则从开馆时间开始
+			if !roomOpen.IsZero() {
+				openT := time.Date(day.Year(), day.Month(), day.Day(), roomOpen.Hour(), roomOpen.Minute(), 0, 0, day.Location())
+				if segStart.Before(openT) {
+					segStart = openT
+				}
+			}
+			// 已经过去的段：整段跳过；正在进行的段从"现在"接着约
+			if !segEnd.After(now.Add(5 * time.Minute)) {
+				skipped++
+				continue
+			}
+			if segStart.Before(now) {
+				segStart = ceil5(now.Add(2 * time.Minute))
+			}
+			if segEnd.Sub(segStart) < time.Hour {
+				skipped++
+				continue
+			}
+			// 已有有效预约覆盖这一段 -> 不用再约
+			if ov, _ := overlapEnd(mine, segStart, segEnd); ov {
+				skipped++
+				continue
+			}
+			lastErr := error(nil)
+			done := false
+			for _, seat := range seats {
+				_, gotEnd, _, err := s.bookWithFallback(c, t, seat, segStart, segEnd, capTime, segEnd.Sub(segStart))
+				if err != nil {
+					lastErr = err
+					continue
+				}
+				booked++
+				done = true
+				log.Printf("[手动] task=%d 座位%s %s %s~%s 预约成功",
+					t.ID, seat, day.Format("01-02"), segStart.Format("15:04"), gotEnd.Format("15:04"))
+				break
+			}
+			if !done && lastErr != nil && firstErr == nil {
+				firstErr = lastErr
+			}
+		}
+	}
+
+	// 汇总状态
+	total := len(segs) * len(days)
+	if !waitUntil.IsZero() {
+		s.setTask(t, fmt.Sprintf("等待放号时刻 %s（手动时间段 %d 段）",
+			waitUntil.Format("2006-01-02 15:04"), total), true)
+		return
+	}
+	msg := fmt.Sprintf("手动时间段：已约 %d 段", booked)
+	if skipped > 0 {
+		msg += fmt.Sprintf("，跳过 %d 段（已约过/已过时/不足1小时）", skipped)
+	}
+	msg += fmt.Sprintf("（共 %d 段，闭馆 %s）", total, t.CapEnd)
+	if firstErr != nil {
+		s.setTask(t, msg+"；失败: "+firstErr.Error(), false)
+		return
+	}
+	s.setTask(t, msg, true)
+}
+
+// handleSign 处理待签到预约。// 签到窗口 = [开始前 20 分钟, 开始后 20 分钟]（多数学校的 preSignDuration 是 30 分钟，取 20 更稳）。
 // 注意：不只记录成功/报错，**响应不是 success 的也要记日志** —— 否则"签了但没签上"会静默发生，
 // 最后变成学校的"被监督/违约"，排查时看不到任何痕迹。
 func (s *Scheduler) handleSign(c *CXClient, t *Task, myRes []ReserveInfo) {

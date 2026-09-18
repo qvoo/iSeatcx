@@ -7,18 +7,18 @@ import (
 
 // AppConfig 系统配置（环境变量注入）。
 type AppConfig struct {
-	Port       string // PORT 默认 8080
-	MySQLDSN   string // MYSQL_DSN 如 seat:pass@tcp(127.0.0.1:3306)/seatbook?charset=utf8mb4&parseTime=true; 为空则使用本地 SQLite
-	SQLitePath string // SQLITE_PATH 默认 seatbook.db
-	CXLoginURL string
-	CXBase     string
-	CXSeatID   string // 座位业务 seatId(105) —— 默认学校
+	Port        string // PORT 默认 8080
+	MySQLDSN    string // MYSQL_DSN 如 seat:pass@tcp(127.0.0.1:3306)/seatbook?charset=utf8mb4&parseTime=true; 为空则使用本地 SQLite
+	SQLitePath  string // SQLITE_PATH 默认 seatbook.db
+	CXLoginURL  string
+	CXBase      string
+	CXSeatID    string // 座位业务 seatId(105) —— 默认学校
 	CXDeptIDEnc string // 单位/校区 deptIdEnc
 	CXSeatIDEnc string // 座位业务 seatIdEnc
 	CXCptchaID  string // 该学校滑块验证码 captchaId
 	CXOpenTime  string // 默认抢第二天座位的时间（预约窗口开启），如 19:00
 	CXMaxHours  int    // 默认单个时间段最大小时数
-	WebDir     string // 前端静态目录
+	WebDir      string // 前端静态目录
 	// 保留业务常量
 }
 

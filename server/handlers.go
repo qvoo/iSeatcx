@@ -347,8 +347,10 @@ func (s *Server) handleRooms(c *gin.Context) {
 }
 
 // POST /api/tasks  创建占座任务
-// req: {type: "seat"|"qr"|"quick", mode: "today_once"|"tomorrow_once"|"both"|"qr",
-//       room_id, seat_id, seat_num, start_time, duration_minutes, room_name, recur_daily, qr_image(b64, 可选)}
+// req: {type: "seat"|"qr"|"quick"|"manual", mode: "today_once"|"tomorrow_once"|"both"|"qr",
+//
+//	room_id, seat_id, seat_num, start_time, duration_minutes, room_name, recur_daily, qr_image(b64, 可选),
+//	segments: [{start:"08:00",end:"12:00"},...] (type=manual 时必填)}
 func (s *Server) handleCreateTask(c *gin.Context) {
 	user, ok := s.authUser(c)
 	if !ok {
@@ -356,19 +358,20 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Type            string `json:"type"`
-		Mode            string `json:"mode"`
-		RoomID          string `json:"room_id"`
-		SeatID          string `json:"seat_id"`
-		SeatNum         string `json:"seat_num"`
-		RoomName        string `json:"room_name"`
-		AltSeats        string `json:"alt_seats"` // 备选座位（逗号分隔）
-		StartTime       string `json:"start_time"`
-		DurationMinutes int    `json:"duration_minutes"`
-		RecurDaily      bool   `json:"recur_daily"`
-		AutoRenew       *bool  `json:"auto_renew"` // 抢座后持续续约（默认开）
-		QRImage         string `json:"qr_image"`
-		AccountID       uint   `json:"account_id"` // 单账号作用域
+		Type            string        `json:"type"`
+		Mode            string        `json:"mode"`
+		RoomID          string        `json:"room_id"`
+		SeatID          string        `json:"seat_id"`
+		SeatNum         string        `json:"seat_num"`
+		RoomName        string        `json:"room_name"`
+		AltSeats        string        `json:"alt_seats"` // 备选座位（逗号分隔）
+		StartTime       string        `json:"start_time"`
+		DurationMinutes int           `json:"duration_minutes"`
+		RecurDaily      bool          `json:"recur_daily"`
+		AutoRenew       *bool         `json:"auto_renew"` // 抢座后持续续约（默认开）
+		QRImage         string        `json:"qr_image"`
+		AccountID       uint          `json:"account_id"` // 单账号作用域
+		Segments        []TimeSegment `json:"segments"`   // 手动时间段任务要预约的时段
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
@@ -414,6 +417,28 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 			req.Mode = "today_once"
 		}
 	}
+	// 手动时间段任务：必须给出合法时段
+	segJSON := ""
+	if req.Type == "manual" {
+		segs := NormalizeSegments(req.Segments)
+		if len(segs) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请至少填写一个时间段（HH:MM 起 ~ HH:MM 止，且开始早于结束）"})
+			return
+		}
+		// 相邻段之间不能重叠（同一账号同一座位重叠会被学校拒绝）
+		for i := 1; i < len(segs); i++ {
+			if segs[i].Start < segs[i-1].End {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("时间段重叠：%s~%s 与 %s~%s",
+					segs[i-1].Start, segs[i-1].End, segs[i].Start, segs[i].End)})
+				return
+			}
+		}
+		b, _ := json.Marshal(segs)
+		segJSON = string(b)
+		if req.Mode == "" {
+			req.Mode = "today_once"
+		}
+	}
 	// 持续续约：seat/quick 默认开启；用户在确认弹窗可关闭
 	autoRenew := true
 	if req.AutoRenew != nil {
@@ -433,6 +458,7 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 		CapEnd:          capEnd,
 		RecurDaily:      req.RecurDaily,
 		AutoRenew:       autoRenew,
+		Segments:        segJSON,
 		Status:          "active",
 		LastAction:      "任务已创建，等待调度",
 	}
@@ -709,24 +735,24 @@ func (s *Server) handleAccounts(c *gin.Context) {
 	var list []User
 	s.db.Order("id asc").Find(&list)
 	type acc struct {
-		ID         uint   `json:"id"`
-		Username   string `json:"username"`
-		SeatID     string `json:"seat_id"`
-		DeptIDEnc  string `json:"dept_id_enc"`
-		SeatIDEnc  string `json:"seat_id_enc"`
-		CaptchaID  string `json:"captcha_id"`
-		School     string `json:"school"`
-		OpenTime   string `json:"open_time"`
-		MaxHours   int    `json:"max_hours"`
-		ApiStyle   string `json:"api_style"`
-		MappID     string `json:"mapp_id"`
-		HallURL    string `json:"hall_url"`
-		WindowMode string `json:"window_mode"`
-		FullDay    bool   `json:"full_day"`
-		BaseURL    string `json:"base_url"`
-		LoginMode  string `json:"login_mode"`
+		ID          uint   `json:"id"`
+		Username    string `json:"username"`
+		SeatID      string `json:"seat_id"`
+		DeptIDEnc   string `json:"dept_id_enc"`
+		SeatIDEnc   string `json:"seat_id_enc"`
+		CaptchaID   string `json:"captcha_id"`
+		School      string `json:"school"`
+		OpenTime    string `json:"open_time"`
+		MaxHours    int    `json:"max_hours"`
+		ApiStyle    string `json:"api_style"`
+		MappID      string `json:"mapp_id"`
+		HallURL     string `json:"hall_url"`
+		WindowMode  string `json:"window_mode"`
+		FullDay     bool   `json:"full_day"`
+		BaseURL     string `json:"base_url"`
+		LoginMode   string `json:"login_mode"`
 		SchoolClose string `json:"school_close"`
-		CreatedAt  string `json:"created_at"`
+		CreatedAt   string `json:"created_at"`
 	}
 	out := make([]acc, 0, len(list))
 	for _, u := range list {
@@ -1162,7 +1188,7 @@ func (s *Server) handleBatchTask(c *gin.Context) {
 			RoomID: req.RoomID, SeatID: req.SeatID, SeatNum: padSeat(seats[i]),
 			RoomName: req.RoomName, StartTime: req.StartTime, DurationMinutes: 240, CapEnd: capEnd,
 			AutoRenew: autoRenew,
-			Status: "active", LastAction: "批量任务已创建，等待调度",
+			Status:    "active", LastAction: "批量任务已创建，等待调度",
 		}
 		s.db.Create(&t)
 		created = append(created, t)

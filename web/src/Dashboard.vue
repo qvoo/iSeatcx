@@ -108,9 +108,11 @@
           <div class="scroll-list" v-else>
             <div v-for="t in scopedTasks" :key="t.id" class="list-item">
               <span class="tag blue">座位{{ t.seat_num }}</span>
-              <span v-if="t.auto_renew" class="tag orange">提前预约</span>
+              <span v-if="t.type === 'manual'" class="tag orange">手动时间段</span>
+              <span v-else-if="t.auto_renew" class="tag orange">提前预约</span>
               <span class="grow">
                 <b>{{ roomsMap[t.room_id] || t.room_name || '房间 '+t.room_id }}</b> · <span class="muted">{{ modeText(t.mode) }}</span>
+                <span v-if="segText(t.segments)" class="muted"> · {{ segText(t.segments) }}</span>
                 <span v-if="t.username" class="muted"> | {{ t.username }}</span><br/>
                 <span class="muted">{{ t.last_action }}</span>
                 <span v-if="t.grab_at" class="muted" style="display:block;margin-top:2px">
@@ -214,44 +216,51 @@
         </div>
       </div>
 
-      <!-- 功能5: 自定义服务器 / 校园统一认证（如中国农业大学图书馆） -->
+      <!-- 功能5: 手动选时间段 -->
       <div class="card card-scroll">
-        <h3><span class="icon" style="background:#c2410c">5</span> 自定义服务器 / 校园认证</h3>
+        <h3><span class="icon" style="background:#c2410c">5</span> 手动选时间段</h3>
         <p class="muted" style="margin-bottom:8px">
-          有些学校的座位系统<b>不在超星域名下</b>（例如中国农业大学图书馆 <code>lib.cau.edu.cn/reserve</code>），
-          登录也走学校自己的<b>统一身份认证（CAS）</b>。填好下面的「服务器地址」和「预约入口链接」后保存，
-          系统会自动按该校域名访问接口、并按统一认证登录。
+          自己指定要约的<b>时间段</b>（可以加多段，例如 08:00~12:00、14:00~18:00）。
+          系统到放号时刻按这些段去约，<b>不自动续约、不接力</b>，约到就停；已经在约的段会自动跳过。
         </p>
         <div class="card-body">
-          <div v-if="accounts.length === 0" class="muted">暂无账号</div>
-          <div v-for="a in accounts" :key="'base'+a.id" class="rule-row">
-            <div class="row" style="gap:8px;align-items:center">
-              <span class="tag blue">{{ a.username }}</span>
-              <span class="tag" :class="ruleEdit[a.id].login_mode==='tpass' ? 'orange' : 'gray'">
-                {{ ruleEdit[a.id].login_mode==='tpass' ? '校园统一认证' : '超星账号' }}
-              </span>
-              <span class="grow"></span>
-              <button class="btn btn-primary btn-sm" @click="saveRules(a)">保存</button>
-            </div>
-            <div class="row" style="gap:8px;margin-top:6px;flex-wrap:wrap">
-              <label class="rule-f" style="flex:1;min-width:240px"><span>服务器地址</span>
-                <input class="input input-sm" v-model="ruleEdit[a.id].base_url"
-                       placeholder="如 http://lib.cau.edu.cn/reserve（留空=超星 office.chaoxing.com）" />
-              </label>
-              <label class="rule-f"><span>登录方式</span>
-                <select class="select" style="min-width:150px" v-model="ruleEdit[a.id].login_mode">
-                  <option value="passport">超星账号（默认）</option>
-                  <option value="tpass">校园统一认证 CAS</option>
-                </select>
-              </label>
-            </div>
-            <input class="input input-sm" style="margin-top:6px" v-model="ruleEdit[a.id].hall_url"
-                   placeholder="预约入口链接（统一认证必填：登录时从这里跳转认证，如 http://lib.cau.edu.cn/reserve/front/third/apps/seatengine/index?...）" />
-            <p class="muted" style="margin-top:6px;font-size:12px">
-              粘贴入口链接后保存：会自动识别 <b>服务器地址</b>（非超星域名时）与 <b>登录方式</b>。
-              该校若还要求填座位参数，请到上面「学校规则」里补。
-            </p>
+          <div class="row" style="gap:8px;flex-wrap:wrap">
+            <label class="rule-f"><span>账号</span>
+              <select class="select" style="min-width:150px" v-model.number="segForm.accountId" @change="loadSegRooms">
+                <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.username }}</option>
+              </select>
+            </label>
+            <label class="rule-f" style="flex:1;min-width:220px"><span>自习室</span>
+              <select class="select" v-model="segForm.roomId">
+                <option value="" disabled>选择自习室…</option>
+                <option v-for="r in segRooms" :key="r.id" :value="r.id">{{ r.name }}（{{ r.open_time || '--' }}~{{ r.cap_end || '--' }}）</option>
+              </select>
+            </label>
           </div>
+          <div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center">
+            <label class="rule-f"><span>座位号</span>
+              <input class="input input-sm" style="width:92px" v-model="segForm.seatNum" placeholder="如 117" />
+            </label>
+            <button class="btn btn-ghost btn-sm" style="flex:none" @click="useManualSeat">用模块1选的座位（{{ manual.seatNum || '--' }}）</button>
+          </div>
+          <label class="label" style="margin-top:8px">预约日期</label>
+          <div class="pills">
+            <span class="pill" :class="{active: segForm.mode==='today_once'}" @click="segForm.mode='today_once'">今天</span>
+            <span class="pill" :class="{active: segForm.mode==='tomorrow_once'}" @click="segForm.mode='tomorrow_once'">明天</span>
+            <span class="pill" :class="{active: segForm.mode==='both'}" @click="segForm.mode='both'">每天都要这些段</span>
+          </div>
+          <label class="label" style="margin-top:8px">时间段（可多段，HH:MM）</label>
+          <div v-for="(r, i) in segForm.rows" :key="'seg'+i" class="row" style="gap:8px;align-items:center;margin-top:4px">
+            <input class="input input-sm" style="width:88px" v-model="r.start" placeholder="08:00" />
+            <span class="muted">~</span>
+            <input class="input input-sm" style="width:88px" v-model="r.end" placeholder="12:00" />
+            <button class="btn btn-ghost btn-sm" :disabled="segForm.rows.length<=1" @click="removeSegRow(i)">删除</button>
+          </div>
+          <button class="btn btn-ghost btn-sm" style="margin-top:8px" @click="addSegRow">+ 添加一段</button>
+          <button class="btn btn-primary" style="width:100%;margin-top:14px" :disabled="segBusy" @click="createSegTask">
+            {{ segBusy ? '创建中…' : '创建手动时间段任务' }}
+          </button>
+          <div class="msg" :class="segOk ? 'ok' : 'err'">{{ segMsg }}</div>
         </div>
       </div>
     </div>
@@ -432,8 +441,7 @@ function schoolSeatId(accountId: number): string {
 const ruleEdit = reactive<Record<number, {
   open_time: string; max_hours: number; seat_id: string;
   dept_id_enc: string; seat_id_enc: string; captcha_id: string; hall_url: string;
-  api_style: string; mapp_id: string; window_mode: string; full_day: boolean;
-  base_url: string; login_mode: string
+  api_style: string; mapp_id: string; window_mode: string; full_day: boolean
 }>>({})
 function syncRuleEdit() {
   // 每次都从服务端最新数据同步，避免"管理账号"与"学校规则"两处编辑互相用旧值覆盖
@@ -449,9 +457,7 @@ function syncRuleEdit() {
       api_style: a.api_style || 'seatengine',
       mapp_id: a.mapp_id || '',
       window_mode: a.window_mode === 'same' ? 'same' : 'prev',
-      full_day: !!a.full_day,
-      base_url: a.base_url || '',
-      login_mode: a.login_mode === 'tpass' ? 'tpass' : 'passport'
+      full_day: !!a.full_day
     }
   }
 }
@@ -484,6 +490,76 @@ async function detectRules(a: Account) {
   } catch (err: any) {
     alert('识别失败: ' + err.message)
   } finally { detecting.value = 0 }
+}
+
+// 功能5：手动选时间段
+const segForm = reactive({
+  accountId: 0,
+  roomId: '',
+  seatNum: '',
+  mode: 'today_once' as 'today_once' | 'tomorrow_once' | 'both',
+  rows: [{ start: '08:00', end: '12:00' }] as { start: string; end: string }[]
+})
+const segRooms = ref<Room[]>([])
+const segBusy = ref(false)
+const segMsg = ref('')
+const segOk = ref(true)
+
+function addSegRow() {
+  const last = segForm.rows[segForm.rows.length - 1]
+  // 默认接在上一段后面，省得手输
+  segForm.rows.push(last && /^\d{1,2}:\d{2}$/.test(last.end) ? { start: last.end, end: '' } : { start: '', end: '' })
+}
+function removeSegRow(i: number) {
+  if (segForm.rows.length > 1) segForm.rows.splice(i, 1)
+}
+function useManualSeat() {
+  if (!manual.seatNum) { segMsg.value = '模块1还没选座位'; segOk.value = false; return }
+  segForm.seatNum = manual.seatNum
+  if (manual.roomId) segForm.roomId = manual.roomId
+  segMsg.value = `已套用模块1的座位 ${manual.seatNum}`; segOk.value = true
+}
+async function loadSegRooms() {
+  segForm.roomId = ''
+  segRooms.value = []
+  if (!segForm.accountId) return
+  try {
+    const res = await api<{ rooms: Room[] }>(`/rooms?account_id=${segForm.accountId}`)
+    segRooms.value = res.rooms
+  } catch (e: any) { segMsg.value = '自习室加载失败: ' + e.message; segOk.value = false }
+}
+async function createSegTask() {
+  segMsg.value = ''
+  if (!segForm.roomId) { segMsg.value = '请选择自习室'; segOk.value = false; return }
+  const seatNum = (segForm.seatNum || '').trim()
+  if (!/^\d{1,4}$/.test(seatNum)) { segMsg.value = '座位号只能是数字（如 117）'; segOk.value = false; return }
+  const segments = segForm.rows
+    .filter(r => (r.start || '').trim() && (r.end || '').trim())
+    .map(r => ({ start: r.start.trim(), end: r.end.trim() }))
+  if (segments.length === 0) { segMsg.value = '请至少填写一个时间段'; segOk.value = false; return }
+  for (const s of segments) {
+    if (!/^\d{1,2}:\d{2}$/.test(s.start) || !/^\d{1,2}:\d{2}$/.test(s.end)) {
+      segMsg.value = `时间段格式应为 HH:MM（${s.start} ~ ${s.end}）`; segOk.value = false; return
+    }
+  }
+  segBusy.value = true
+  try {
+    const room = segRooms.value.find(r => r.id === segForm.roomId)
+    const acc = accounts.value.find(a => a.id === segForm.accountId)
+    const res = await api<{ task: Task }>('/tasks', {
+      method: 'POST',
+      body: JSON.stringify({
+        type: 'manual', mode: segForm.mode,
+        room_id: segForm.roomId, seat_id: acc?.seat_id || mySeatId.value,
+        seat_num: seatNum, room_name: room?.name || '',
+        segments, auto_renew: false, account_id: segForm.accountId
+      })
+    })
+    segOk.value = true
+    segMsg.value = `任务 #${res.task.id} 已创建：${segments.map(s => s.start + '~' + s.end).join('、')}`
+    await refreshAll()
+  } catch (e: any) { segOk.value = false; segMsg.value = '创建失败: ' + e.message }
+  finally { segBusy.value = false }
 }
 
 const manual = reactive({ roomId: '', seatNum: '', seatInput: '', altInput: '', mode: 'today_once', day: 'today' })
@@ -524,7 +600,15 @@ const confirm = reactive({
 })
 
 function modeText(m: string) {
-  return { today_once: '预约今天', tomorrow_once: '预约明天', both: '每天自动占座', qr: '扫码·占座到闭馆' }[m] || m
+  return { today_once: '预约今天', tomorrow_once: '预约明天', both: '每天自动占座', qr: '扫码·占座到闭馆', manual: '手动时间段' }[m] || m
+}
+// 手动时间段任务：把 segments JSON 显示成 "08:00~12:00、14:00~18:00"
+function segText(json: string | undefined): string {
+  if (!json) return ''
+  try {
+    const arr = JSON.parse(json) as { start: string; end: string }[]
+    return arr.map(s => `${s.start}~${s.end}`).join('、')
+  } catch { return '' }
 }
 
 async function refreshAll() {

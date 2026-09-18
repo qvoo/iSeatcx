@@ -354,7 +354,7 @@ func (c *CXClient) Reserve(day, start, end, seatNum, captchaToken, submitEnc str
 
 // ReserveResult 提交返回。
 type ReserveResult struct {
-	Success bool  `json:"success"`
+	Success bool   `json:"success"`
 	Msg     string `json:"msg"`
 	ID      int64  `json:"-"`
 	EndAt   int64  `json:"-"`
@@ -363,7 +363,7 @@ type ReserveResult struct {
 // ParseReserve 解析预约响应。返回 (reserveId, endAtMs, 原响应)。与 status=0 校验。
 func (c *CXClient) ParseReserve(respText string) (int64, int64, error) {
 	var m struct {
-		Success bool `json:"success"`
+		Success bool   `json:"success"`
 		Msg     string `json:"msg"`
 		Data    struct {
 			SeatReserve struct {
@@ -860,15 +860,15 @@ func (c *CXClient) RoomSeats(seatID, roomID, day, start, end string) ([]SeatCell
 
 // RoomItem 自习室列表项。
 type RoomItem struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Floor1    string `json:"floor1"`
-	Floor2    string `json:"floor2"`
-	Floor3    string `json:"floor3"`
-	CapEnd    string `json:"cap_end"`
-	OpenTime  string `json:"open_time"`
-	Capacity  int    `json:"capacity"`
-	IsOpen    int    `json:"is_open"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Floor1   string `json:"floor1"`
+	Floor2   string `json:"floor2"`
+	Floor3   string `json:"floor3"`
+	CapEnd   string `json:"cap_end"`
+	OpenTime string `json:"open_time"`
+	Capacity int    `json:"capacity"`
+	IsOpen   int    `json:"is_open"`
 }
 
 // cxSpecialTime 房间"按星期的开放/闭馆时间"。

@@ -32,6 +32,8 @@ export interface Task {
   reserve_end_at: number
   grab_ms: number
   grab_at: number
+  grab_day?: string
+  segments?: string
   created_at: string
   updated_at: string
 }

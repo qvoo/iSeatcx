@@ -88,7 +88,7 @@ func TestProbeSubmitSignature(t *testing.T) {
 	t.Logf("提交(%s 23:00~23:30) 响应: %s", day, truncate(resp, 400))
 
 	var m struct {
-		Success bool `json:"success"`
+		Success bool   `json:"success"`
 		Msg     string `json:"msg"`
 	}
 	_ = json.Unmarshal([]byte(resp), &m)

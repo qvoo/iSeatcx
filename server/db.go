@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,28 +14,28 @@ import (
 
 // User 登录用户（chaoxing 账号）。
 type User struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	Username  string    `gorm:"uniqueIndex;size:64" json:"username"`
-	Password  string    `json:"-"` // AES 加密后的密文存储
-	UID       string    `json:"uid"`
-	SeatID    string    `gorm:"size:32" json:"seat_id"`      // 该账号所属学校/单位的座位业务 seatId
-	DeptIDEnc string    `gorm:"size:64" json:"dept_id_enc"`  // 该账号学校/单位 deptIdEnc
-	SeatIDEnc string    `gorm:"size:64" json:"seat_id_enc"`  // 该账号学校/单位 seatIdEnc
-	CaptchaID string    `gorm:"size:64" json:"captcha_id"`   // 该账号学校/单位的滑块验证码 captchaId
+	ID        uint   `gorm:"primaryKey" json:"id"`
+	Username  string `gorm:"uniqueIndex;size:64" json:"username"`
+	Password  string `json:"-"` // AES 加密后的密文存储
+	UID       string `json:"uid"`
+	SeatID    string `gorm:"size:32" json:"seat_id"`     // 该账号所属学校/单位的座位业务 seatId
+	DeptIDEnc string `gorm:"size:64" json:"dept_id_enc"` // 该账号学校/单位 deptIdEnc
+	SeatIDEnc string `gorm:"size:64" json:"seat_id_enc"` // 该账号学校/单位 seatIdEnc
+	CaptchaID string `gorm:"size:64" json:"captcha_id"`  // 该账号学校/单位的滑块验证码 captchaId
 	// ---- 模块4/5：每个学校/账号的规则（各校规则不同，可单独设置）----
-	OpenTime  string `gorm:"size:8" json:"open_time"`  // 抢座时刻(预约窗口开启)，默认 19:00
-	MaxHours  int    `json:"max_hours"`                // 单个时间段最大小时数，默认 4
-	ApiStyle  string `gorm:"size:16" json:"api_style"` // 座位系统类型: seatengine(默认) | seat
-	MappID    string `gorm:"size:32" json:"mapp_id"`   // seat 类型的 mappId
-	HallURL   string `gorm:"size:512" json:"hall_url"` // 预约大厅链接（抓包识别用）
+	OpenTime string `gorm:"size:8" json:"open_time"`  // 抢座时刻(预约窗口开启)，默认 19:00
+	MaxHours int    `json:"max_hours"`                // 单个时间段最大小时数，默认 4
+	ApiStyle string `gorm:"size:16" json:"api_style"` // 座位系统类型: seatengine(默认) | seat
+	MappID   string `gorm:"size:32" json:"mapp_id"`   // seat 类型的 mappId
+	HallURL  string `gorm:"size:512" json:"hall_url"` // 预约大厅链接（抓包识别用）
 	// ---- 模块5：放号方式（各校不同）----
 	WindowMode string `gorm:"size:8" json:"window_mode"` // 预约窗口开放日: prev=前一天(默认,如19:00抢明天) | same=当天早上(如07:00抢当天)
 	FullDay    bool   `json:"full_day"`                  // 一次性预约满一整天：直接约到闭馆时间（不用分段）
 	// ---- 模块6：非超星域名的学校（如中国农业大学图书馆 lib.cau.edu.cn/reserve）----
-	BaseURL   string    `gorm:"size:255" json:"base_url"`  // 自定义服务器地址；空=office.chaoxing.com
-	LoginMode string    `gorm:"size:16" json:"login_mode"` // passport(超星账号,默认) | tpass(校园统一认证)
-	SchoolClose string  `gorm:"size:8" json:"school_close"` // 该校系统真实闭馆时间（抓包识别，用于收紧房间时间）
-	CreatedAt time.Time `json:"created_at"`
+	BaseURL     string    `gorm:"size:255" json:"base_url"`   // 自定义服务器地址；空=office.chaoxing.com
+	LoginMode   string    `gorm:"size:16" json:"login_mode"`  // passport(超星账号,默认) | tpass(校园统一认证)
+	SchoolClose string    `gorm:"size:8" json:"school_close"` // 该校系统真实闭馆时间（抓包识别，用于收紧房间时间）
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // SessionToken 登录会话。
@@ -48,31 +50,32 @@ type SessionToken struct {
 // Type: seat(手动选座) qr(扫码) quick(快速预约)
 // Mode: today_once | tomorrow_once | both(今日+明日, 之后每日自动) | qr_chain(扫码, 占座到闭馆+每日)
 type Task struct {
-	ID                uint      `gorm:"primaryKey" json:"id"`
-	UserID            uint      `gorm:"index" json:"user_id"`
-	Type              string    `gorm:"size:16" json:"type"`
-	Mode              string    `gorm:"size:24" json:"mode"`
-	RoomID            string    `gorm:"size:32" json:"room_id"`
-	SeatID            string    `gorm:"size:32" json:"seat_id"` // 座位业务ID(如105)
-	SeatNum           string    `gorm:"size:16" json:"seat_num"`
-	AltSeats          string    `gorm:"size:128" json:"alt_seats"` // 备选座位（逗号分隔，如 117,118,120）：当前座位约不下去时自动换下一个
-	RoomName          string    `gorm:"size:128" json:"room_name"`
-	StartTime         string    `gorm:"size:8" json:"start_time"` // 期望开始 HH:MM
-	DurationMinutes   int       `json:"duration_minutes"`         // 单段时长
-	CapEnd            string    `gorm:"size:8" json:"cap_end"`    // 该房间闭馆时间(自动遍历)
-	RecurDaily        bool      `json:"recur_daily"`              // 每日重复(占座到闭馆循环)
-	AutoRenew         bool      `json:"auto_renew"`               // 抢到座位后持续续约+签到(默认开启)
-	Status            string    `gorm:"size:16;index" json:"status"` // active|paused|done|error
-	LastAction        string    `gorm:"type:text" json:"last_action"`
-	LastOK            bool      `json:"last_ok"`
-	ReserveID         int64     `json:"reserve_id"`         // 最近一次预约 id
-	ReserveEndAt      int64     `json:"reserve_end_at"`     // 最近预约结束毫秒时间戳
-	GrabMs            int64     `json:"grab_ms"`            // 本轮放号首抢耗时（毫秒）
-	GrabAt            int64     `json:"grab_at"`            // 本轮放号首抢到的时刻（毫秒时间戳）
-	GrabDay           string    `gorm:"size:16" json:"grab_day"` // 上面这次"抢到"对应的目标日（同一轮放号只记首次）
-	Username          string    `gorm:"-" json:"username"`  // 所属账号（联表展示）
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	UserID          uint      `gorm:"index" json:"user_id"`
+	Type            string    `gorm:"size:16" json:"type"`
+	Mode            string    `gorm:"size:24" json:"mode"`
+	RoomID          string    `gorm:"size:32" json:"room_id"`
+	SeatID          string    `gorm:"size:32" json:"seat_id"` // 座位业务ID(如105)
+	SeatNum         string    `gorm:"size:16" json:"seat_num"`
+	AltSeats        string    `gorm:"size:128" json:"alt_seats"` // 备选座位（逗号分隔，如 117,118,120）：当前座位约不下去时自动换下一个
+	RoomName        string    `gorm:"size:128" json:"room_name"`
+	StartTime       string    `gorm:"size:8" json:"start_time"`    // 期望开始 HH:MM
+	DurationMinutes int       `json:"duration_minutes"`            // 单段时长
+	CapEnd          string    `gorm:"size:8" json:"cap_end"`       // 该房间闭馆时间(自动遍历)
+	RecurDaily      bool      `json:"recur_daily"`                 // 每日重复(占座到闭馆循环)
+	AutoRenew       bool      `json:"auto_renew"`                  // 抢到座位后持续续约+签到(默认开启)
+	Status          string    `gorm:"size:16;index" json:"status"` // active|paused|done|error
+	LastAction      string    `gorm:"type:text" json:"last_action"`
+	LastOK          bool      `json:"last_ok"`
+	ReserveID       int64     `json:"reserve_id"`               // 最近一次预约 id
+	ReserveEndAt    int64     `json:"reserve_end_at"`           // 最近预约结束毫秒时间戳
+	GrabMs          int64     `json:"grab_ms"`                  // 本轮放号首抢耗时（毫秒）
+	GrabAt          int64     `json:"grab_at"`                  // 本轮放号首抢到的时刻（毫秒时间戳）
+	GrabDay         string    `gorm:"size:16" json:"grab_day"`  // 上面这次"抢到"对应的目标日（同一轮放号只记首次）
+	Segments        string    `gorm:"size:512" json:"segments"` // 手动时间段任务：JSON [{"start":"08:00","end":"12:00"},...]
+	Username        string    `gorm:"-" json:"username"`        // 所属账号（联表展示）
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // QrCode 共享二维码库（用户上传的座位二维码，全员可复用）。
@@ -137,6 +140,50 @@ func (u *User) schoolKey() string {
 		base = "office"
 	}
 	return base + "|" + u.ApiStyle + "|" + u.SeatID + "|" + u.DeptIDEnc + "|" + u.MappID
+}
+
+// TimeSegment 一个手动时间段（HH:MM ~ HH:MM）。
+type TimeSegment struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// NormalizeSegments 清洗手动时间段：去掉非法项、去重、按开始时间排序。
+func NormalizeSegments(in []TimeSegment) []TimeSegment {
+	var out []TimeSegment
+	seen := map[string]bool{}
+	for _, s := range in {
+		st, e1 := parseHM(s.Start)
+		en, e2 := parseHM(s.End)
+		if e1 != nil || e2 != nil || !en.After(st) {
+			continue
+		}
+		key := st.Format("15:04") + "-" + en.Format("15:04")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, TimeSegment{Start: st.Format("15:04"), End: en.Format("15:04")})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Start != out[j].Start {
+			return out[i].Start < out[j].Start
+		}
+		return out[i].End < out[j].End
+	})
+	return out
+}
+
+// manualSegments 解析手动时间段任务的时间段列表（Task.Segments 是 JSON）。
+func (t *Task) manualSegments() []TimeSegment {
+	if strings.TrimSpace(t.Segments) == "" {
+		return nil
+	}
+	var raw []TimeSegment
+	if err := json.Unmarshal([]byte(t.Segments), &raw); err != nil {
+		return nil
+	}
+	return NormalizeSegments(raw)
 }
 
 // seatCandidates 返回候选座位列表（去重、按顺序，当前座位排最前）。

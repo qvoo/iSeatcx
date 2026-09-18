@@ -22,14 +22,14 @@ import (
 )
 
 const (
-	cxCaptchaID    = "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1"
-	cxType         = "slide"
-	cxVersion      = "1.1.20"
-	cxRunEnv       = 10
-	cxBase         = "https://captcha.chaoxing.com"
-	cxCallback     = "cx_captcha_function"
-	cxMaxSlideX    = 264
-	cxOffsetsInit  = "0,-4,4,-8,8,-12,12,-16,16,-20,20"
+	cxCaptchaID   = "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1"
+	cxType        = "slide"
+	cxVersion     = "1.1.20"
+	cxRunEnv      = 10
+	cxBase        = "https://captcha.chaoxing.com"
+	cxCallback    = "cx_captcha_function"
+	cxMaxSlideX   = 264
+	cxOffsetsInit = "0,-4,4,-8,8,-12,12,-16,16,-20,20"
 )
 
 var cxJSONPRe = regexp.MustCompile(`^[^(]*\((.*)\)\s*;?\s*$`)
@@ -157,9 +157,9 @@ func (s *CaptchaSolver) solveOnce(referer string, offset int, captchaID string) 
 	cutURL, _ := vo["cutoutImage"].(string)
 	// 并行下载两张图，节省约一半图片等待时间
 	var (
-		shade, cut   []byte
-		errS, errC   error
-		wg           sync.WaitGroup
+		shade, cut []byte
+		errS, errC error
+		wg         sync.WaitGroup
 	)
 	wg.Add(2)
 	go func() { defer wg.Done(); shade, errS = s.get(shadeURL, referer) }()
