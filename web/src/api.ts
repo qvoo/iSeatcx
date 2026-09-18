@@ -18,6 +18,7 @@ export interface Task {
   room_id: string
   seat_id: string
   seat_num: string
+  alt_seats: string
   room_name: string
   start_time: string
   duration_minutes: number
@@ -29,6 +30,8 @@ export interface Task {
   last_ok: boolean
   reserve_id: number
   reserve_end_at: number
+  grab_ms: number
+  grab_at: number
   created_at: string
   updated_at: string
 }
@@ -66,6 +69,16 @@ export interface Account {
   seat_id_enc?: string
   captcha_id?: string
   school?: string
+  open_time?: string
+  max_hours?: number
+  api_style?: string
+  mapp_id?: string
+  hall_url?: string
+  window_mode?: string
+  full_day?: boolean
+  base_url?: string
+  login_mode?: string
+  school_close?: string
   created_at?: string
 }
 

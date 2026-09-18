@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,9 +40,17 @@ type CaptchaSolver struct {
 	client *http.Client
 }
 
-// NewCaptchaSolver 创建求解器。
+// NewCaptchaSolver 创建求解器（连接复用 + 更快超时，抢座争分夺秒）。
 func NewCaptchaSolver() *CaptchaSolver {
-	return &CaptchaSolver{client: &http.Client{Timeout: 25 * time.Second}}
+	tr := &http.Transport{
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	return &CaptchaSolver{client: &http.Client{Timeout: 15 * time.Second, Transport: tr}}
 }
 
 func (s *CaptchaSolver) get(u string, referer string) ([]byte, error) {
@@ -114,9 +123,9 @@ func (s *CaptchaSolver) Solve(referer string, maxAttempt int, captchaID string) 
 		if token != "" {
 			return token, nil
 		}
-		// 避免过快请求触发验证码风控
+		// 避免过快请求触发验证码风控（缩短间隔以提升抢座速度）
 		if i < maxAttempt-1 {
-			time.Sleep(1500 * time.Millisecond)
+			time.Sleep(400 * time.Millisecond)
 		}
 	}
 	return "", fmt.Errorf("滑块验证失败(%d次)", maxAttempt)
@@ -146,13 +155,21 @@ func (s *CaptchaSolver) solveOnce(referer string, offset int, captchaID string) 
 	}
 	shadeURL, _ := vo["shadeImage"].(string)
 	cutURL, _ := vo["cutoutImage"].(string)
-	shade, err := s.get(shadeURL, referer)
-	if err != nil {
-		return "", err
+	// 并行下载两张图，节省约一半图片等待时间
+	var (
+		shade, cut   []byte
+		errS, errC   error
+		wg           sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() { defer wg.Done(); shade, errS = s.get(shadeURL, referer) }()
+	go func() { defer wg.Done(); cut, errC = s.get(cutURL, referer) }()
+	wg.Wait()
+	if errS != nil {
+		return "", errS
 	}
-	cut, err := s.get(cutURL, referer)
-	if err != nil {
-		return "", err
+	if errC != nil {
+		return "", errC
 	}
 	bestX, err := matchGapX(shade, cut)
 	if err != nil {

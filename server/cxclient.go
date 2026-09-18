@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,18 +30,30 @@ type CXClient struct {
 	SeatID     string
 	RoomID     string
 	SeatNum    string
-	DeptIDEnc  string // 学校/单位 deptIdEnc
+	DeptIDEnc  string // 学校/单位 deptIdEnc（seat 代际下作为 fidEnc）
 	SeatIDEnc  string // 座位业务 seatIdEnc
 	CaptchaID  string // 学校滑块验证码 captchaId
+	APIPrefix  string // 接口前缀（按代际）：/data/apps/seatengine 或 /data/apps/seat
+	CodePath   string // 座位码页路径（按代际）
+	MappID     string // seat 代际的 mappId
 	UserAgent  string
 	Debug      bool
 
+	mu     sync.Mutex // 同一账号多个任务并发时，保护抢座过程中会变的字段（RoomID/SeatNum/SeatID）
 	client *http.Client
 }
 
-// NewCXClient 创建客户端。
+// NewCXClient 创建客户端（连接复用，抢座链路要连续发多个请求）。
 func NewCXClient(baseOffice, loginURL, seatID, roomID, seatNum string) *CXClient {
 	jar, _ := cookiejar.New(nil)
+	tr := &http.Transport{
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
 	return &CXClient{
 		BaseOffice: baseOffice,
 		LoginURL:   loginURL,
@@ -47,7 +61,7 @@ func NewCXClient(baseOffice, loginURL, seatID, roomID, seatNum string) *CXClient
 		RoomID:     roomID,
 		SeatNum:    seatNum,
 		UserAgent:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-		client:     &http.Client{Jar: jar, Timeout: 30 * time.Second},
+		client:     &http.Client{Jar: jar, Timeout: 20 * time.Second, Transport: tr},
 	}
 }
 
@@ -64,6 +78,52 @@ func (c *CXClient) SetSchool(deptIDEnc, seatIDEnc, captchaID string) {
 	}
 }
 
+// SetApiStyle 切换座位系统代际：
+//   - "seatengine"（默认，较新）：/data/apps/seatengine/*，用 seatId + deptIdEnc
+//   - "seat"（较旧一代）：/data/apps/seat/*，用 mappId + fidEnc
+//
+// 两代签名机制相同（提交时带 submit_enc + MD5 enc），仅前缀与学校标识参数不同。
+func (c *CXClient) SetApiStyle(style, mappID, fidEnc string) {
+	if style == "seat" {
+		c.APIPrefix = "/data/apps/seat"
+		c.CodePath = "/front/third/apps/seat/code"
+		c.MappID = mappID
+		if fidEnc != "" {
+			c.DeptIDEnc = fidEnc
+		}
+		return
+	}
+	c.APIPrefix = "/data/apps/seatengine"
+	c.CodePath = "/front/apps/seatengine/code"
+}
+
+// p 拼接接口路径（按当前代际）。
+func (c *CXClient) p(path string) string {
+	prefix := c.APIPrefix
+	if prefix == "" {
+		prefix = "/data/apps/seatengine"
+	}
+	return prefix + path
+}
+
+// isSeatStyle 是否 seat（旧一代）接口风格。
+func (c *CXClient) isSeatStyle() bool { return c.APIPrefix == "/data/apps/seat" }
+
+// codePageURL 生成"座位码页"URL（用于取 submit_enc 与验证码 referer）。
+func (c *CXClient) codePageURL(roomID, seatNum string) string {
+	path := c.CodePath
+	if path == "" {
+		path = "/front/apps/seatengine/code"
+	}
+	if c.isSeatStyle() {
+		return fmt.Sprintf("%s%s?id=%s&seatNum=%s&mappId=%s&fidEnc=%s",
+			c.BaseOffice, path, url.QueryEscape(roomID), url.QueryEscape(seatNum),
+			url.QueryEscape(c.MappID), url.QueryEscape(c.DeptIDEnc))
+	}
+	return fmt.Sprintf("%s%s?id=%s&seatNum=%s&seatId=%s",
+		c.BaseOffice, path, url.QueryEscape(roomID), url.QueryEscape(seatNum), url.QueryEscape(c.SeatID))
+}
+
 func (c *CXClient) applyHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", c.UserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -71,17 +131,31 @@ func (c *CXClient) applyHeaders(req *http.Request) {
 }
 
 func (c *CXClient) do(req *http.Request) (int, []byte, error) {
+	status, body, _, err := c.doURL(req)
+	return status, body, err
+}
+
+// doURL 与 do 相同，但额外返回"跟随跳转后的最终 URL"（统一认证要按最终站点拼表单地址）。
+func (c *CXClient) doURL(req *http.Request) (int, []byte, string, error) {
 	c.applyHeaders(req)
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	return resp.StatusCode, body, err
+	final := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		final = resp.Request.URL.String()
+	}
+	return resp.StatusCode, body, final, err
 }
 
 func (c *CXClient) postForm(path string, form url.Values) (int, []byte, error) {
+	// 按代际替换接口前缀：seat 这一代用 /data/apps/seat/*
+	if c.isSeatStyle() && strings.HasPrefix(path, "/data/apps/seatengine/") {
+		path = "/data/apps/seat/" + strings.TrimPrefix(path, "/data/apps/seatengine/")
+	}
 	req, err := http.NewRequest(http.MethodPost, c.BaseOffice+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return 0, nil, err
@@ -90,6 +164,26 @@ func (c *CXClient) postForm(path string, form url.Values) (int, []byte, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	return c.do(req)
+}
+
+// addSchoolParams 按代际写入"学校标识"参数：
+// seatengine -> seatId(+seatIdEnc)；seat -> mappId(+fidEnc)
+func (c *CXClient) addSchoolParams(form url.Values) {
+	if c.isSeatStyle() {
+		if c.MappID != "" {
+			form.Set("mappId", c.MappID)
+		}
+		if c.DeptIDEnc != "" {
+			form.Set("fidEnc", c.DeptIDEnc)
+		}
+		return
+	}
+	if c.SeatID != "" {
+		form.Set("seatId", c.SeatID)
+	}
+	if c.SeatIDEnc != "" {
+		form.Set("seatIdEnc", c.SeatIDEnc)
+	}
 }
 
 // Login 使用 chaoxing 账号密码登录（fanyalogin）。
@@ -138,6 +232,59 @@ var (
 	reSubmitEnc = regexp.MustCompile(`(?i)id="submit_enc"\s+value="([^"]+)"`)
 )
 
+// 大厅页面里的学校参数（各校页面都会内联这些变量）。
+var (
+	reCapMappID    = regexp.MustCompile(`(?i)mappId['"]?\s*[:=]\s*['"]?(\d+)`)
+	reCapSeatID    = regexp.MustCompile(`(?i)\bseatId['"]?\s*[:=]\s*['"]?(\d{1,12})\b`)
+	reCapSeatIDEnc = regexp.MustCompile(`(?i)seatIdEnc['"]?\s*[:=]\s*['"]?([0-9a-fA-F]{8,})`)
+	reCapDeptEnc   = regexp.MustCompile(`(?i)(?:deptIdEnc|fidEnc)['"]?\s*[:=]\s*['"]?([0-9a-fA-F]{8,})`)
+	reCapCaptchaID = regexp.MustCompile(`(?i)captchaId['"]?\s*[:=]\s*['"]?([A-Za-z0-9]{10,})`)
+)
+
+// CaptureHall 抓取「预约大厅链接」页面并识别该校参数（需要已登录的会话）。
+// 返回 mapp_id / seat_id / seat_id_enc / dept_id_enc / captcha_id / api_style。
+// 说明：大厅页面的 JS 里内联了这些值，比只看 URL 查询串更全（例如 seatIdEnc）。
+func (c *CXClient) CaptureHall(link string) map[string]string {
+	out := map[string]string{}
+	if link == "" {
+		return out
+	}
+	if !strings.HasPrefix(link, "http") {
+		link = c.BaseOffice + link
+	}
+	req, err := http.NewRequest(http.MethodGet, link, nil)
+	if err != nil {
+		return out
+	}
+	c.applyHeaders(req)
+	_, body, err := c.do(req)
+	if err != nil {
+		return out
+	}
+	page := string(body)
+	if m := reCapMappID.FindStringSubmatch(page); len(m) == 2 && m[1] != "0" {
+		out["mapp_id"] = m[1]
+	}
+	if m := reCapSeatID.FindStringSubmatch(page); len(m) == 2 {
+		out["seat_id"] = m[1]
+	}
+	if m := reCapSeatIDEnc.FindStringSubmatch(page); len(m) == 2 {
+		out["seat_id_enc"] = m[1]
+	}
+	if m := reCapDeptEnc.FindStringSubmatch(page); len(m) == 2 {
+		out["dept_id_enc"] = m[1]
+	}
+	if m := reCapCaptchaID.FindStringSubmatch(page); len(m) == 2 {
+		out["captcha_id"] = m[1]
+	}
+	if strings.Contains(link, "/apps/seatengine/") {
+		out["api_style"] = "seatengine"
+	} else if strings.Contains(link, "/apps/seat/") {
+		out["api_style"] = "seat"
+	}
+	return out
+}
+
 // CodePage 座位页字段。
 type CodePage struct {
 	RoomID    string
@@ -146,10 +293,13 @@ type CodePage struct {
 	SubmitEnc string
 }
 
-// FetchCodePage 获取座位页并解析 submit_enc。
+// FetchCodePage 获取座位页并解析 submit_enc（自动按代际选 URL）。
 func (c *CXClient) FetchCodePage(roomID, seatNum, seatID string) (*CodePage, error) {
-	u := fmt.Sprintf("%s/front/apps/seatengine/code?id=%s&seatNum=%s&seatId=%s",
-		c.BaseOffice, url.QueryEscape(roomID), url.QueryEscape(seatNum), url.QueryEscape(seatID))
+	if !c.isSeatStyle() && c.CodePath == "" {
+		// 兼容旧调用：未显式设置代际时用 seatengine
+		c.SetApiStyle("seatengine", "", "")
+	}
+	u := c.codePageURL(roomID, seatNum)
 	req, _ := http.NewRequest(http.MethodGet, u, nil)
 	c.applyHeaders(req)
 	_, body, err := c.do(req)
@@ -235,11 +385,14 @@ func (c *CXClient) ParseReserve(respText string) (int64, int64, error) {
 }
 
 // SignIn 签到（roomID/seatID 显式传入，不依赖 client 瞬时状态，避免会话重登后为空）。
+// seatengine 代际需要 {id, seatId, roomId}；seat 代际只需要 {id}。
 func (c *CXClient) SignIn(reserveID int64, roomID, seatID string) (string, error) {
 	form := url.Values{}
 	form.Set("id", strconv.FormatInt(reserveID, 10))
-	form.Set("seatId", seatID)
-	form.Set("roomId", roomID)
+	if !c.isSeatStyle() {
+		form.Set("seatId", seatID)
+		form.Set("roomId", roomID)
+	}
 	_, body, err := c.postForm("/data/apps/seatengine/sign", form)
 	if err != nil {
 		return "", err
@@ -247,12 +400,33 @@ func (c *CXClient) SignIn(reserveID int64, roomID, seatID string) (string, error
 	return string(body), nil
 }
 
-// SignBack 退座。
+// SignBack 退座。seat 代际的 signback 还需要 objectId（先查 getstatus 拿）。
 func (c *CXClient) SignBack(reserveID int64) (string, error) {
 	form := url.Values{}
 	form.Set("id", strconv.FormatInt(reserveID, 10))
+	if c.isSeatStyle() {
+		if oid := c.reserveObjectID(reserveID); oid != "" {
+			form.Set("objectId", oid)
+		}
+	}
 	_, body, err := c.postForm("/data/apps/seatengine/signback", form)
 	return string(body), err
+}
+
+var reObjectID = regexp.MustCompile(`"objectId"\s*:\s*"?([^",}]+)"?`)
+
+// reserveObjectID 取预约的 objectId（seat 代际退座用）。
+func (c *CXClient) reserveObjectID(reserveID int64) string {
+	form := url.Values{}
+	form.Set("reserveId", strconv.FormatInt(reserveID, 10))
+	_, body, err := c.postForm("/data/apps/seatengine/getstatus", form)
+	if err != nil {
+		return ""
+	}
+	if m := reObjectID.FindStringSubmatch(string(body)); len(m) == 2 {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
 }
 
 // CancelReserve 取消预约。
@@ -285,14 +459,7 @@ func (r *ReserveInfo) RoomIDStr() string {
 
 // MyReserves 查询当前/近期预约。
 func (c *CXClient) MyReserves(seatID string) (cur []ReserveInfo, near []ReserveInfo, err error) {
-	form := url.Values{}
-	form.Set("seatId", seatID)
-	if c.SeatIDEnc != "" {
-		form.Set("seatIdEnc", c.SeatIDEnc)
-	} else {
-		form.Set("seatIdEnc", "9dffbb2440d6a600")
-	}
-	_, body, err := c.postForm("/data/apps/seatengine/index", form)
+	body, err := c.indexRaw(seatID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -308,78 +475,250 @@ func (c *CXClient) MyReserves(seatID string) (cur []ReserveInfo, near []ReserveI
 	return m.Data.CurReserves, m.Data.NearReserves, nil
 }
 
+// indexRaw 请求 seatengine/seat 的 index 接口（含 seatConfig 全局配置与我的预约）。
+func (c *CXClient) indexRaw(seatID string) ([]byte, error) {
+	form := url.Values{}
+	if c.isSeatStyle() {
+		// seat 这一代：只需要 fidEnc，且带随机数
+		if c.DeptIDEnc != "" {
+			form.Set("fidEnc", c.DeptIDEnc)
+		}
+		form.Set("r", strconv.FormatFloat(rand.Float64()*100, 'f', -1, 64))
+	} else {
+		form.Set("seatId", seatID)
+		if c.SeatIDEnc != "" {
+			form.Set("seatIdEnc", c.SeatIDEnc)
+		} else {
+			form.Set("seatIdEnc", "9dffbb2440d6a600")
+		}
+	}
+	_, body, err := c.postForm("/data/apps/seatengine/index", form)
+	return body, err
+}
+
+// SeatRule 从学校座位配置里识别出来的放号规则（各校不同）。
+type SeatRule struct {
+	OpenTime   string // 抢座时刻：开放预约的时刻（reserveBeforeTime）
+	WindowMode string // prev=前一天开放(默认) | same=当天早上开放
+	FullDay    bool   // 不限单次预约时长 -> 可以一次性约满整天（到闭馆）
+	MaxHours   int    // 单段最长小时数（>0 时自动填入；0 表示不限）
+	OpenFrom   string // 当天开馆时间
+	CloseAt    string // 当天闭馆时间
+	NumLimit   int    // 同时可持有的预约段数
+}
+
+// String 便于日志/界面展示。
+func (r *SeatRule) String() string {
+	if r == nil {
+		return ""
+	}
+	mode := "前一天开放"
+	if r.WindowMode == "same" {
+		mode = "当天早上开放"
+	}
+	dur := fmt.Sprintf("单段最长%d小时", r.MaxHours)
+	if r.FullDay {
+		dur = "可一次约满整天"
+	} else if r.MaxHours <= 0 {
+		dur = "单段时长未知"
+	}
+	return fmt.Sprintf("%s %s 放号（%s，开馆%s 闭馆%s）", r.OpenTime, mode, dur, r.OpenFrom, r.CloseAt)
+}
+
+// FetchSeatRule 读取该校座位配置，识别放号规则：
+//   - reserveBeforeDay == 0  -> 当天早上开放（有些学校第二天早上才放号）
+//   - reserveBeforeDay >= 1  -> 前一天开放（默认 19:00 抢明天那种）
+//   - reserveDuration == 0   -> 不限单次时长，可一次约满整天（约到闭馆）
+func (c *CXClient) FetchSeatRule(seatID string) (*SeatRule, error) {
+	body, err := c.indexRaw(seatID)
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		Data struct {
+			SeatConfig struct {
+				ReserveBeforeDay    int            `json:"reserveBeforeDay"`
+				ReserveBeforeTime   string         `json:"reserveBeforeTime"`
+				ReserveDuration     float64        `json:"reserveDuration"`
+				ReserveDurationType int            `json:"reserveDurationType"`
+				ReserveNumLimit     int            `json:"reserveNumLimit"`
+				CommonTimeConfig    map[string]any `json:"commonTimeConfig"`
+			} `json:"seatConfig"`
+		} `json:"data"`
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	sc := m.Data.SeatConfig
+	r := &SeatRule{OpenTime: sc.ReserveBeforeTime, NumLimit: sc.ReserveNumLimit, WindowMode: "prev"}
+	if sc.ReserveBeforeDay == 0 {
+		r.WindowMode = "same"
+	}
+	r.FullDay = sc.ReserveDuration <= 0
+	if !r.FullDay {
+		// reserveDurationType=1 表示按分钟计
+		if sc.ReserveDurationType == 1 {
+			r.MaxHours = (int(sc.ReserveDuration) + 30) / 60
+		} else {
+			r.MaxHours = int(sc.ReserveDuration + 0.5)
+		}
+	}
+	// 当天开馆/闭馆时间（commonTimeConfig 按星期）
+	dayKey := []string{"sun", "mon", "tues", "wed", "thur", "fri", "sat"}[int(time.Now().Weekday())]
+	if v, ok := sc.CommonTimeConfig[dayKey+"StartTime"].(string); ok {
+		r.OpenFrom = v
+	}
+	if v, ok := sc.CommonTimeConfig[dayKey+"EndTime"].(string); ok {
+		r.CloseAt = v
+	}
+	if r.OpenTime == "" && !m.Success {
+		return nil, fmt.Errorf("该校座位配置读取失败: %s", truncate(string(body), 150))
+	}
+	return r, nil
+}
+
 // RoomInfo 房间信息原始响应。
 func (c *CXClient) RoomInfo(roomID string) ([]byte, error) {
 	form := url.Values{}
 	form.Set("id", roomID)
+	if c.isSeatStyle() && c.DeptIDEnc != "" {
+		form.Set("fidEnc", c.DeptIDEnc) // 官方页面：room/info 带 fidEnc
+	}
 	_, body, err := c.postForm("/data/apps/seatengine/room/info", form)
 	return body, err
 }
 
 // RoomCapEnd 房间闭馆时间（遍历 room/info 的开放时间规则，按星期）。
 func (c *CXClient) RoomCapEnd(roomID string) (string, error) {
-	return c.RoomCapEndAt(roomID, time.Now())
+	_, close, err := c.RoomOpenCloseAt(roomID, time.Now())
+	return close, err
 }
 
 // RoomCapEndAt 按指定日期取房间闭馆时间。
-// 遍历优先级（与官方列表页 reLoadData 一致）：
-//  1. seatRoom.seatEngineSpecialTime 特殊开放时间（某座位/房间按星期）
-//  2. seatConfig.openTimeLongSettingJson.openTimeHourEnd
-//  3. seatConfig.commonTimeConfig.<星期>EndTime
 func (c *CXClient) RoomCapEndAt(roomID string, t time.Time) (string, error) {
+	_, close, err := c.RoomOpenCloseAt(roomID, t)
+	return close, err
+}
+
+// RoomOpenCloseAt 按指定日期取房间的【开馆时间 + 闭馆时间】。
+// 遍历优先级（与官方列表页 reLoadData 一致）：
+//  1. seatRoom.seatEngineSpecialTime / seatRoom.seatSpecialTime 特殊开放时间（按星期）
+//  2. seatConfig.openTimeLongSettingJson（全天段）
+//  3. seatConfig.commonTimeConfig.<星期>StartTime / <星期>EndTime
+//
+// 注意：开馆时间同样重要 —— 有些房间某天 14:30 才开，若从 14:00 开始约，
+// 服务端会直接拒绝："所选时间段和系统开放时间段不一致"。
+func (c *CXClient) RoomOpenCloseAt(roomID string, t time.Time) (open, close string, err error) {
 	body, err := c.RoomInfo(roomID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var m struct {
 		Data struct {
 			SeatConfig struct {
 				OpenTimeLongSettingJson struct {
-					OpenTimeHourEnd string `json:"openTimeHourEnd"`
+					OpenTimeHourStart string `json:"openTimeHourStart"`
+					OpenTimeHourEnd   string `json:"openTimeHourEnd"`
 				} `json:"openTimeLongSettingJson"`
 				CommonTimeConfig map[string]any `json:"commonTimeConfig"`
 			} `json:"seatConfig"`
 			SeatRoom struct {
-				SpecialTime *struct {
-					MonEnd   string `json:"monEndTime"`
-					TuesEnd  string `json:"tuesEndTime"`
-					WedEnd   string `json:"wedEndTime"`
-					ThurEnd  string `json:"thurEndTime"`
-					FriEnd   string `json:"friEndTime"`
-					SatEnd   string `json:"satEndTime"`
-					SunEnd   string `json:"sunEndTime"`
-				} `json:"seatEngineSpecialTime"`
+				SpecialTime  *cxSpecialTime `json:"seatEngineSpecialTime"`
+				SpecialTime2 *cxSpecialTime `json:"seatSpecialTime"` // seat 旧版
 			} `json:"seatRoom"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &m); err != nil {
-		return "", err
+		return "", "", err
 	}
 	weekdayKeys := []string{"sun", "mon", "tues", "wed", "thur", "fri", "sat"}
 	dayKey := weekdayKeys[int(t.Weekday())]
 
-	// 1. 特殊开放时间（优先）
-	if st := m.Data.SeatRoom.SpecialTime; st != nil {
-		end, err := fieldByDay(dayKey, st.MonEnd, st.TuesEnd, st.WedEnd, st.ThurEnd, st.FriEnd, st.SatEnd, st.SunEnd)
-		if err == nil {
-			log.Printf("[闭馆遍历] room=%s %s 特殊开放时间=%s", roomID, dayKey, end)
-			return end, nil
+	// 1. 房间级"特殊开放时间"
+	sOpen, sClose := "", ""
+	st := m.Data.SeatRoom.SpecialTime
+	if st == nil {
+		st = m.Data.SeatRoom.SpecialTime2
+	}
+	if st != nil {
+		if end, e1 := fieldByDay(dayKey, st.MonEnd, st.TuesEnd, st.WedEnd, st.ThurEnd, st.FriEnd, st.SatEnd, st.SunEnd); e1 == nil {
+			sClose = end
+		}
+		if start, e2 := fieldByDay(dayKey, st.MonStart, st.TuesStart, st.WedStart, st.ThurStart, st.FriStart, st.SatStart, st.SunStart); e2 == nil {
+			sOpen = start
 		}
 	}
-	// 2. 通用模板
+	// 2. 学校级通用时间 / 全天段
 	sc := m.Data.SeatConfig
-	if sc.OpenTimeLongSettingJson.OpenTimeHourEnd != "" {
-		return sc.OpenTimeLongSettingJson.OpenTimeHourEnd, nil
+	cOpen, cClose := "", ""
+	if v, ok := sc.CommonTimeConfig[dayKey+"StartTime"]; ok {
+		cOpen, _ = v.(string)
 	}
-	// 3. 星期配置
-	commonEnd := ""
 	if v, ok := sc.CommonTimeConfig[dayKey+"EndTime"]; ok {
-		commonEnd, _ = v.(string)
+		cClose, _ = v.(string)
 	}
-	if commonEnd != "" {
-		return commonEnd, nil
+
+	// 以【房间级"特殊开放时间"】为准：实测它才是真正能约到的区间
+	// （例如某校 schoolConfig 里写 22:00，但房间实际到 23:30，且确实能约到 23:30）。
+	// schoolConfig 的 commonTimeConfig 只作为"房间没配时间"时的兜底。
+	if sClose != "" {
+		log.Printf("[开放时间] room=%s %s 房间级=%s~%s（学校级为 %s~%s，仅供参考）",
+			roomID, dayKey, sOpen, sClose, cOpen, cClose)
+		return sOpen, sClose, nil
 	}
-	return "", fmt.Errorf("未获取到房间关闭时间")
+	open = laterHM(cOpen, sc.OpenTimeLongSettingJson.OpenTimeHourStart)
+	close = earlierHM(cClose, sc.OpenTimeLongSettingJson.OpenTimeHourEnd)
+	if close == "" {
+		return "", "", fmt.Errorf("未获取到房间开放时间")
+	}
+	log.Printf("[开放时间] room=%s %s 房间级未配置，采用学校级 %s~%s", roomID, dayKey, open, close)
+	return open, close, nil
+}
+
+// validHM 是否为合法 HH:MM。
+func validHM(s string) bool {
+	_, err := parseHM(s)
+	return err == nil
+}
+
+// laterHM 取最晚的合法时刻（忽略空值/非法值）。
+func laterHM(vals ...string) string {
+	best := ""
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if !validHM(v) {
+			continue
+		}
+		if best == "" || v > best {
+			best = v
+		}
+	}
+	return best
+}
+
+// earlierHM 取最早的合法时刻（忽略空值/非法值）。
+func earlierHM(vals ...string) string {
+	best := ""
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if !validHM(v) {
+			continue
+		}
+		if best == "" || v < best {
+			best = v
+		}
+	}
+	return best
+}
+
+// RoomOpenAt 按指定日期取房间开馆时间（取不到返回空串）。
+func (c *CXClient) RoomOpenAt(roomID string, t time.Time) string {
+	open, _, err := c.RoomOpenCloseAt(roomID, t)
+	if err != nil {
+		return ""
+	}
+	return open
 }
 
 func fieldByDay(day string, mon, tues, wed, thur, fri, sat, sun string) (string, error) {
@@ -410,40 +749,69 @@ type SeatCell struct {
 	Disabled  bool   `json:"disabled"` // 区域暂停预约(isReserve=0)
 }
 
+// flexInt 兼容 JSON 中同时可能是数字或字符串的整数字段（超星不同房间返回类型不一致）。
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" || s == `""` || s == "" {
+		*f = 0
+		return nil
+	}
+	s = strings.Trim(s, `"`)
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		// 形如 "A12" 之类无法转数字时按 0 处理，不阻断整体解析
+		*f = 0
+		return nil
+	}
+	*f = flexInt(n)
+	return nil
+}
+
+func (f flexInt) Int() int { return int(f) }
+
 // RoomSeats 获取房间座位网格状态：数字网格(startSeatNum~capacity) + 占用 + 暂停。
-func (c *CXClient) RoomSeats(seatID, roomID, day, start, end string) ([]SeatCell, error) {
+// 第二个返回值表示"占用信息是否可信"：seat 旧版系统的 getusedseatnums 会返回空列表
+// （接口存在但不报占用），这时不能把格子都当成"可选"，界面上要提示用户自行确认。
+func (c *CXClient) RoomSeats(seatID, roomID, day, start, end string) ([]SeatCell, bool, error) {
 	body, err := c.RoomInfo(roomID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var m struct {
 		Data struct {
 			SeatRoom struct {
-				StartSeatNum int `json:"startSeatNum"`
-				Capacity     int `json:"capacity"`
+				StartSeatNum flexInt `json:"startSeatNum"`
+				Capacity     flexInt `json:"capacity"`
 			} `json:"seatRoom"`
 			SeatAttributes []struct {
-				SeatNum   int `json:"seatNum"`
-				IsReserve int `json:"isReserve"`
+				SeatNum   flexInt `json:"seatNum"`
+				IsReserve flexInt `json:"isReserve"`
 			} `json:"seatAttributes"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	capacity := m.Data.SeatRoom.Capacity
-	startSeat := m.Data.SeatRoom.StartSeatNum
+	capacity := m.Data.SeatRoom.Capacity.Int()
+	startSeat := m.Data.SeatRoom.StartSeatNum.Int()
 	if startSeat == 0 {
 		startSeat = 1
 	}
 	if capacity <= 0 || capacity > 500 {
-		return nil, fmt.Errorf("座位数异常: %d", capacity)
+		return nil, false, fmt.Errorf("座位数异常: %d", capacity)
 	}
 
 	// 占用集合
 	occupied := map[string]bool{}
+	occupiedKnown := false
 	form := url.Values{}
-	form.Set("seatId", seatID)
+	c.addSchoolParams(form)
 	form.Set("roomId", roomID)
 	form.Set("startTime", start)
 	form.Set("endTime", end)
@@ -455,19 +823,22 @@ func (c *CXClient) RoomSeats(seatID, roomID, day, start, end string) ([]SeatCell
 					SeatNum string `json:"seatNum"`
 				} `json:"seatReserves"`
 			} `json:"data"`
+			Success bool `json:"success"`
 		}
 		if json.Unmarshal(b, &used) == nil {
 			for _, r := range used.Data.SeatReserves {
 				occupied[padSeat(r.SeatNum)] = true
 			}
+			// 新版系统：空列表就是"都空着"，可信；旧版系统：空列表代表"接口不报占用"，不可信
+			occupiedKnown = len(used.Data.SeatReserves) > 0 || !c.isSeatStyle()
 		}
 	}
 
 	// 暂停集合
 	paused := map[string]bool{}
 	for _, a := range m.Data.SeatAttributes {
-		if a.IsReserve == 0 {
-			paused[padSeat(strconv.Itoa(a.SeatNum))] = true
+		if a.IsReserve.Int() == 0 {
+			paused[padSeat(strconv.Itoa(a.SeatNum.Int()))] = true
 		}
 	}
 
@@ -484,7 +855,7 @@ func (c *CXClient) RoomSeats(seatID, roomID, day, start, end string) ([]SeatCell
 		cell.Available = !cell.Occupied && !cell.Disabled
 		out = append(out, cell)
 	}
-	return out, nil
+	return out, occupiedKnown, nil
 }
 
 // RoomItem 自习室列表项。
@@ -500,6 +871,33 @@ type RoomItem struct {
 	IsOpen    int    `json:"is_open"`
 }
 
+// cxSpecialTime 房间"按星期的开放/闭馆时间"。
+// 注意：两代接口字段名不同 —— seatengine 用 seatEngineSpecialTime，seat 旧版用 seatSpecialTime，
+// 但内部字段名一致（monStartTime/monEndTime...），所以共用一个结构体。
+type cxSpecialTime struct {
+	MonOpen   int    `json:"monOpen"`
+	MonStart  string `json:"monStartTime"`
+	MonEnd    string `json:"monEndTime"`
+	TuesOpen  int    `json:"tuesOpen"`
+	TuesStart string `json:"tuesStartTime"`
+	TuesEnd   string `json:"tuesEndTime"`
+	WedOpen   int    `json:"wedOpen"`
+	WedStart  string `json:"wedStartTime"`
+	WedEnd    string `json:"wedEndTime"`
+	ThurOpen  int    `json:"thurOpen"`
+	ThurStart string `json:"thurStartTime"`
+	ThurEnd   string `json:"thurEndTime"`
+	FriOpen   int    `json:"friOpen"`
+	FriStart  string `json:"friStartTime"`
+	FriEnd    string `json:"friEndTime"`
+	SatOpen   int    `json:"satOpen"`
+	SatStart  string `json:"satStartTime"`
+	SatEnd    string `json:"satEndTime"`
+	SunOpen   int    `json:"sunOpen"`
+	SunStart  string `json:"sunStartTime"`
+	SunEnd    string `json:"sunEndTime"`
+}
+
 // RoomList 全部自习室列表（room/list 分页拉取）。
 func (c *CXClient) RoomList(seatID, day string) ([]RoomItem, error) {
 	var out []RoomItem
@@ -508,12 +906,23 @@ func (c *CXClient) RoomList(seatID, day string) ([]RoomItem, error) {
 	for {
 		form := url.Values{}
 		form.Set("day", day)
-		if c.DeptIDEnc != "" {
-			form.Set("deptIdEnc", c.DeptIDEnc)
+		if c.isSeatStyle() {
+			// 注意：这一代 room/list 要的是 deptIdEnc（fidEnc 会被忽略，返回空列表）
+			if c.MappID != "" {
+				form.Set("mappId", c.MappID)
+			}
+			if c.DeptIDEnc != "" {
+				form.Set("deptIdEnc", c.DeptIDEnc)
+				form.Set("fidEnc", c.DeptIDEnc)
+			}
 		} else {
-			form.Set("deptIdEnc", "0fd2b43990df8985")
+			if c.DeptIDEnc != "" {
+				form.Set("deptIdEnc", c.DeptIDEnc)
+			} else {
+				form.Set("deptIdEnc", "0fd2b43990df8985")
+			}
+			form.Set("seatId", seatID)
 		}
-		form.Set("seatId", seatID)
 		form.Set("cpage", strconv.Itoa(page))
 		form.Set("pageSize", strconv.Itoa(pageSize))
 		_, body, err := c.postForm("/data/apps/seatengine/room/list", form)
@@ -523,29 +932,14 @@ func (c *CXClient) RoomList(seatID, day string) ([]RoomItem, error) {
 		var m struct {
 			Data struct {
 				SeatRoomList []struct {
-					ID              int64  `json:"id"`
-					FirstLevelName  string `json:"firstLevelName"`
-					SecondLevelName string `json:"secondLevelName"`
-					ThirdLevelName  string `json:"thirdLevelName"`
-					Capacity        int    `json:"capacity"`
-					IsShow          int    `json:"isShow"`
-					SpecialTime     *struct {
-						MonOpen  int    `json:"monOpen"`
-						MonStart string `json:"monStartTime"`
-						MonEnd   string `json:"monEndTime"`
-						TuesOpen  int    `json:"tuesOpen"`
-						TuesEnd   string `json:"tuesEndTime"`
-						WedOpen   int    `json:"wedOpen"`
-						WedEnd    string `json:"wedEndTime"`
-						ThurOpen  int    `json:"thurOpen"`
-						ThurEnd   string `json:"thurEndTime"`
-						FriOpen   int    `json:"friOpen"`
-						FriEnd    string `json:"friEndTime"`
-						SatOpen   int    `json:"satOpen"`
-						SatEnd    string `json:"satEndTime"`
-						SunOpen   int    `json:"sunOpen"`
-						SunEnd    string `json:"sunEndTime"`
-					} `json:"seatEngineSpecialTime"`
+					ID              int64          `json:"id"`
+					FirstLevelName  string         `json:"firstLevelName"`
+					SecondLevelName string         `json:"secondLevelName"`
+					ThirdLevelName  string         `json:"thirdLevelName"`
+					Capacity        int            `json:"capacity"`
+					IsShow          int            `json:"isShow"`
+					SpecialTime     *cxSpecialTime `json:"seatEngineSpecialTime"`
+					SpecialTime2    *cxSpecialTime `json:"seatSpecialTime"` // seat 旧版
 				} `json:"seatRoomList"`
 				TotalPage int `json:"totalPage"`
 			} `json:"data"`
@@ -567,8 +961,12 @@ func (c *CXClient) RoomList(seatID, day string) ([]RoomItem, error) {
 				Capacity: r.Capacity,
 				IsOpen:   r.IsShow,
 			}
-			if r.SpecialTime != nil {
-				item.CapEnd, item.OpenTime = weekdayOpenClose(r.SpecialTime)
+			st := r.SpecialTime
+			if st == nil {
+				st = r.SpecialTime2
+			}
+			if st != nil {
+				item.CapEnd, item.OpenTime = weekdayOpenClose(st)
 			}
 			out = append(out, item)
 		}
@@ -584,35 +982,19 @@ func weekdayIdx() int {
 	return int(time.Now().Weekday())
 }
 
-func weekdayOpenClose(st *struct {
-	MonOpen  int    `json:"monOpen"`
-	MonStart string `json:"monStartTime"`
-	MonEnd   string `json:"monEndTime"`
-	TuesOpen  int    `json:"tuesOpen"`
-	TuesEnd   string `json:"tuesEndTime"`
-	WedOpen   int    `json:"wedOpen"`
-	WedEnd    string `json:"wedEndTime"`
-	ThurOpen  int    `json:"thurOpen"`
-	ThurEnd   string `json:"thurEndTime"`
-	FriOpen   int    `json:"friOpen"`
-	FriEnd    string `json:"friEndTime"`
-	SatOpen   int    `json:"satOpen"`
-	SatEnd    string `json:"satEndTime"`
-	SunOpen   int    `json:"sunOpen"`
-	SunEnd    string `json:"sunEndTime"`
-}) (end, start string) {
+func weekdayOpenClose(st *cxSpecialTime) (end, start string) {
 	items := []struct {
 		open  int
 		start string
 		end   string
 	}{
-		{st.SunOpen, "", st.SunEnd},
+		{st.SunOpen, st.SunStart, st.SunEnd},
 		{st.MonOpen, st.MonStart, st.MonEnd},
-		{st.TuesOpen, "", st.TuesEnd},
-		{st.WedOpen, "", st.WedEnd},
-		{st.ThurOpen, "", st.ThurEnd},
-		{st.FriOpen, "", st.FriEnd},
-		{st.SatOpen, "", st.SatEnd},
+		{st.TuesOpen, st.TuesStart, st.TuesEnd},
+		{st.WedOpen, st.WedStart, st.WedEnd},
+		{st.ThurOpen, st.ThurStart, st.ThurEnd},
+		{st.FriOpen, st.FriStart, st.FriEnd},
+		{st.SatOpen, st.SatStart, st.SatEnd},
 	}
 	i := weekdayIdx()
 	return items[i].end, items[i].start

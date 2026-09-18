@@ -37,13 +37,14 @@ body {
 .input-sm { width: 100%; border: 1.5px solid #e4e9f2; border-radius: 10px; padding: 7px 10px; font-size: 12px; background: #fbfcfe; outline: none; min-width: 130px; flex: 1; }
 .input-sm:focus { border-color: #3b7cff; background: #fff; }
 .school-edit { padding: 8px 10px; background: #f7faff; border: 1px solid #e4e9f2; border-radius: 12px; }
-/* 功能2/3 卡片：固定高度，内容超出显示滚动条，账号多不再把页面拉长 */
+/* 功能2/3 卡片：固定高度，卡片内部【单一】滚动区，账号多不再把页面拉长 */
 .card-scroll { height: 480px; display: flex; flex-direction: column; }
-.card-scroll .card-body { flex: 1; overflow-y: auto; min-height: 0; padding-right: 4px; }
-.scroll-list { max-height: 100%; overflow-y: auto; overscroll-behavior: contain; }
-.scroll-list::-webkit-scrollbar { width: 8px; }
-.scroll-list::-webkit-scrollbar-thumb { background: #d5dae4; border-radius: 8px; }
-.scroll-list::-webkit-scrollbar-track { background: transparent; }
+.card-scroll .card-body { flex: 1; overflow-y: auto; min-height: 0; padding-right: 6px; overscroll-behavior: contain; }
+/* 列表本身不再滚动，避免与 .card-body 形成嵌套双层滚动条（导致只能滑一个） */
+.scroll-list { overflow: visible; max-height: none; }
+.card-scroll .card-body::-webkit-scrollbar { width: 8px; }
+.card-scroll .card-body::-webkit-scrollbar-thumb { background: #d5dae4; border-radius: 8px; }
+.card-scroll .card-body::-webkit-scrollbar-track { background: transparent; }
 .auto-renew { display: flex; gap: 8px; align-items: center; margin: 12px 0 4px; font-size: 13px; color: #5a6478; cursor: pointer; }
 .auto-renew input { width: 16px; height: 16px; accent-color: #3b7cff; }
 .acc-cb { width: 16px; height: 16px; accent-color: #3b7cff; flex: 0 0 auto; }
@@ -63,6 +64,9 @@ body {
 .row > * { flex: 1; }
 .grow { flex: 1; }
 .muted { color: #98a1b3; font-size: 12.5px; }
+.fast { color: #22a06b; }
+.mid { color: #e08f1f; }
+.slow { color: #e05555; }
 .msg { font-size: 13px; margin-top: 10px; }
 .msg.ok { color: #22a06b; }
 .msg.err { color: #e05555; }
@@ -115,6 +119,18 @@ body {
 .seat.off { background: #eef0f5; color: #aab2c2; cursor: not-allowed; }
 .seat.off:hover { border-color: transparent; transform: none; }
 .seat.sel { background: #3b7cff; color: #fff; font-weight: 700; box-shadow: 0 3px 10px rgba(59,124,255,.4); }
+/* 备选座位（可多选，橙色） */
+.seat.alt { background: #e08f1f; color: #fff; font-weight: 700; box-shadow: 0 3px 10px rgba(224,143,31,.4); }
+.alt-chip {
+  display: inline-flex; align-items: center; gap: 4px; margin: 0 6px 6px 0;
+  background: #fff4e3; color: #c77700; border: 1.5px solid #ffd9a8;
+  border-radius: 999px; padding: 3px 10px; font-size: 12.5px; cursor: pointer;
+}
+.alt-chip:hover { background: #ffe9cc; }
+/* 功能4：学校规则 */
+.rule-row { padding: 10px 0; border-bottom: 1px solid #f0f3f9; }
+.rule-f { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: #7c8698; flex: 1; }
+.rule-f .input-sm { min-width: 80px; }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; }
 
 /* 免责声明 */

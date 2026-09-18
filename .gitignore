@@ -35,3 +35,10 @@ run.err
 # 系统文件
 Thumbs.db
 .DS_Store
+probe_page.html
+probe_*.html
+probe_*.json
+*.log.txt
+
+# 从学校页面抓下来的第三方 JS（des.js 只用于生成 des_gen.go，不随仓库分发）
+server/des.js
