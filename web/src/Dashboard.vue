@@ -33,6 +33,13 @@
           <option value="" disabled>选择自习室…</option>
           <option v-for="r in rooms" :key="r.id" :value="r.id">{{ r.name }}（{{ r.open_time || '--' }}~{{ r.cap_end || '--' }}）</option>
         </select>
+        <div v-if="roomFallback" class="muted" style="font-size:12px;color:#c2410c;margin-top:4px">
+          该账号的学校参数查不到自习室列表，这里列出的是它「约过的房间」。<br/>
+          想看到完整列表：到超星 App/网页里打开该账号的自习室预约页，把地址栏链接（带 fidEnc / mappId）重新贴到「管理账号 → 学校规则 → 大厅链接」保存。
+        </div>
+        <div v-else-if="rooms.length === 0" class="muted" style="font-size:12px;color:#c2410c;margin-top:4px">
+          没有查到自习室：多半是「大厅链接」里的 fidEnc 与这个账号的学校对不上，请重新粘贴该账号预约页的链接后保存。
+        </div>
 
         <div class="row" style="margin-top:12px;gap:8px">
           <span class="pill" :class="{active: manual.day==='today'}" @click="manual.day='today';loadSeats()">今天 {{ todayLabel }}</span>
@@ -115,6 +122,10 @@
                 <span v-if="segText(t.segments)" class="muted"> · {{ segText(t.segments) }}</span>
                 <span v-if="t.username" class="muted"> | {{ t.username }}</span><br/>
                 <span class="muted">{{ t.last_action }}</span>
+                <span v-if="skipText(t.skip_segments)" class="muted" style="display:block;margin-top:2px">
+                  ⏭️ 已跳过你取消的时段：{{ skipText(t.skip_segments) }}
+                  <span class="muted">（不会自动补回；想接着补约就点「暂停 → 恢复」）</span>
+                </span>
                 <span v-if="t.grab_at" class="muted" style="display:block;margin-top:2px">
                   ⚡ 抢座响应：<b :class="t.grab_ms < 3000 ? 'fast' : (t.grab_ms < 8000 ? 'mid' : 'slow')">{{ (t.grab_ms/1000).toFixed(1) }}s</b>
                   <span class="muted"> · 抢到于 {{ new Date(t.grab_at).toLocaleString('zh-CN') }}</span>
@@ -195,6 +206,20 @@
                 <span>一次性约满整天（自动找闭馆时间，不用分段）</span>
               </label>
             </div>
+            <div class="row" style="gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center">
+              <label class="rule-f"><span>最多同时持有</span>
+                <input class="input input-sm" type="number" min="0" max="12" v-model.number="ruleEdit[a.id].max_reserves"
+                       placeholder="0" title="留 0 = 不限制：一直往后约，直到学校自己不让约为止" />
+              </label>
+              <span class="muted" style="font-size:12px">段（含正在使用的那段；<b>0 = 不限制</b>，一直约到学校不让约为止）</span>
+            </div>
+            <div class="row" style="gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center">
+              <label class="auto-renew" style="flex:0 0 auto" title="约不上时，自动改用本房间这一时段确实空闲的其他座位（实时查询占用，不猜）">
+                <input type="checkbox" v-model="ruleEdit[a.id].auto_seat" />
+                <span>座位被占时自动换本房间空位</span>
+              </label>
+              <span class="muted" style="font-size:12px">适合"座位总是被别人先抢走"的情况；开了以后可能会约到别的座位号</span>
+            </div>
             <div class="row" style="gap:6px;margin-top:6px;flex-wrap:wrap">
               <label class="rule-f"><span>系统代际</span>
                 <select class="select" style="min-width:120px" v-model="ruleEdit[a.id].api_style">
@@ -257,6 +282,23 @@
             <button class="btn btn-ghost btn-sm" :disabled="segForm.rows.length<=1" @click="removeSegRow(i)">删除</button>
           </div>
           <button class="btn btn-ghost btn-sm" style="margin-top:8px" @click="addSegRow">+ 添加一段</button>
+
+          <!-- 时间段模板：存一套常用段，下次一键套用 -->
+          <div class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap;align-items:center">
+            <span class="muted" style="font-size:12px;flex:none">模板：</span>
+            <span v-for="tpl in segTemplates" :key="'tpl'+tpl.id" class="pill tpl-pill"
+                  :title="'点一下套用：' + tplText(tpl)" @click="applySegTemplate(tpl)">
+              {{ tpl.name }}
+              <b class="tpl-x" title="删除模板" @click.stop="deleteSegTemplate(tpl)">×</b>
+            </span>
+            <span v-if="segTemplates.length===0" class="muted" style="font-size:12px">
+              还没有模板（填好上面几段后点「存为模板」，例如 09:00~13:00、14:00~18:00、18:00~22:00）
+            </span>
+            <span class="grow"></span>
+            <button class="btn btn-ghost btn-sm" style="flex:none" @click="saveSegTemplate">💾 存为模板</button>
+          </div>
+          <div class="msg" :class="segTplOk ? 'ok' : 'err'" v-if="segTplMsg">{{ segTplMsg }}</div>
+
           <button class="btn btn-primary" style="width:100%;margin-top:14px" :disabled="segBusy" @click="createSegTask">
             {{ segBusy ? '创建中…' : '创建手动时间段任务' }}
           </button>
@@ -358,7 +400,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { api, clearToken, STATUS_TEXT, type Room, type Task, type Reserve, type Account } from './api'
+import { api, clearToken, STATUS_TEXT, type Room, type Task, type Reserve, type Account, type SegmentTemplate } from './api'
 import logo from './assets/logo.png'
 
 const emit = defineEmits(['logout'])
@@ -404,6 +446,7 @@ async function batchDeleteAccount() {
 }
 
 const rooms = ref<Room[]>([])
+const roomFallback = ref(false) // 自习室列表是"用你约过的房间兜底"来的
 const nearReserves = ref<(Reserve & { username?: string })[]>([])
 const curReserves = ref<(Reserve & { username?: string })[]>([])
 const tasks = ref<Task[]>([])
@@ -441,7 +484,7 @@ function schoolSeatId(accountId: number): string {
 const ruleEdit = reactive<Record<number, {
   open_time: string; max_hours: number; seat_id: string;
   dept_id_enc: string; seat_id_enc: string; captcha_id: string; hall_url: string;
-  api_style: string; mapp_id: string; window_mode: string; full_day: boolean
+  api_style: string; mapp_id: string; window_mode: string; full_day: boolean; auto_seat: boolean; max_reserves: number
 }>>({})
 function syncRuleEdit() {
   // 每次都从服务端最新数据同步，避免"管理账号"与"学校规则"两处编辑互相用旧值覆盖
@@ -457,7 +500,9 @@ function syncRuleEdit() {
       api_style: a.api_style || 'seatengine',
       mapp_id: a.mapp_id || '',
       window_mode: a.window_mode === 'same' ? 'same' : 'prev',
-      full_day: !!a.full_day
+      full_day: !!a.full_day,
+      auto_seat: !!a.auto_seat,
+      max_reserves: a.max_reserves ?? 0
     }
   }
 }
@@ -504,6 +549,67 @@ const segRooms = ref<Room[]>([])
 const segBusy = ref(false)
 const segMsg = ref('')
 const segOk = ref(true)
+// 时间段模板
+const segTemplates = ref<SegmentTemplate[]>([])
+const segTplMsg = ref('')
+const segTplOk = ref(true)
+
+// tplText 模板里的时间段展示成 "09:00~13:00、14:00~18:00"
+function tplText(tpl: SegmentTemplate): string {
+  try {
+    const arr = JSON.parse(tpl.segments) as { start: string; end: string }[]
+    return arr.map(s => `${s.start}~${s.end}`).join('、')
+  } catch { return tpl.segments }
+}
+async function loadSegTemplates() {
+  try {
+    const res = await api<{ templates: SegmentTemplate[] }>('/seg-templates')
+    segTemplates.value = res.templates || []
+  } catch { /* 拉不到就先用空列表，不影响其它功能 */ }
+}
+// 把当前填好的几段存成模板（同名直接覆盖）
+async function saveSegTemplate() {
+  segTplMsg.value = ''
+  const segments = segForm.rows
+    .filter(r => (r.start || '').trim() && (r.end || '').trim())
+    .map(r => ({ start: r.start.trim(), end: r.end.trim() }))
+  if (segments.length === 0) { segTplMsg.value = '先把时间段填好，再存为模板'; segTplOk.value = false; return }
+  const preset = segments.map(s => `${s.start}~${s.end}`).join('、')
+  const name = (window.prompt('模板名称（同名会覆盖，最多 20 字）', preset.slice(0, 20)) || '').trim()
+  if (!name) return
+  try {
+    const res = await api<{ msg?: string }>('/seg-templates', {
+      method: 'POST', body: JSON.stringify({ name, segments })
+    })
+    await loadSegTemplates()
+    segTplMsg.value = `已保存模板「${name}」：${preset}` + (res.msg ? `（${res.msg}）` : '')
+    segTplOk.value = true
+  } catch (e: any) {
+    segTplMsg.value = '模板保存失败: ' + e.message; segTplOk.value = false
+  }
+}
+// 点一下模板就把时间段套进编辑框
+function applySegTemplate(tpl: SegmentTemplate) {
+  try {
+    const arr = JSON.parse(tpl.segments) as { start: string; end: string }[]
+    if (!arr.length) return
+    segForm.rows = arr.map(s => ({ start: s.start, end: s.end }))
+    segTplMsg.value = `已套用模板「${tpl.name}」：${tplText(tpl)}`
+    segTplOk.value = true
+  } catch {
+    segTplMsg.value = '模板内容损坏，请重新保存'; segTplOk.value = false
+  }
+}
+async function deleteSegTemplate(tpl: SegmentTemplate) {
+  if (!window.confirm(`删除模板「${tpl.name}」？`)) return
+  try {
+    await api(`/seg-templates/${tpl.id}`, { method: 'DELETE' })
+    await loadSegTemplates()
+    segTplMsg.value = `已删除模板「${tpl.name}」`; segTplOk.value = true
+  } catch (e: any) {
+    segTplMsg.value = '删除失败: ' + e.message; segTplOk.value = false
+  }
+}
 
 function addSegRow() {
   const last = segForm.rows[segForm.rows.length - 1]
@@ -611,11 +717,25 @@ function segText(json: string | undefined): string {
   } catch { return '' }
 }
 
+// 被用户手动取消、引擎已不再补约的时段（毫秒时间戳 JSON）→ "09-20 14:00"
+function skipText(json: string | undefined): string {
+  if (!json) return ''
+  try {
+    const arr = JSON.parse(json) as { start: number; end: number }[]
+    if (!arr.length) return ''
+    return arr.map(s => {
+      const d = new Date(s.start)
+      const p = (n: number) => String(n).padStart(2, '0')
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+    }).join('、')
+  } catch { return '' }
+}
+
 async function refreshAll() {
   const roomsQ = scope.mode === 'single' && scope.accountId ? `?account_id=${scope.accountId}` : ''
   // 各请求独立处理：某一接口失败（如某账号会话过期）不应阻断账号/任务列表刷新
   const [rRes, accRes, tRes] = await Promise.allSettled([
-    api<{ rooms: Room[] }>(`/rooms${roomsQ}`),
+    api<{ rooms: Room[]; fallback?: boolean }>(`/rooms${roomsQ}`),
     api<{ accounts: Account[] }>('/accounts'),
     api<{ tasks: Task[] }>('/tasks')
   ])
@@ -626,7 +746,10 @@ async function refreshAll() {
     selectedIds.value = new Set([...selectedIds.value].filter(id => validIds.has(id)))
   }
   if (tRes.status === 'fulfilled') tasks.value = tRes.value.tasks
-  if (rRes.status === 'fulfilled') rooms.value = rRes.value.rooms
+  if (rRes.status === 'fulfilled') {
+    rooms.value = rRes.value.rooms
+    roomFallback.value = !!rRes.value.fallback
+  }
 
   // 任一接口未登录 -> 退出
   for (const res of [rRes, accRes, tRes]) {
@@ -636,6 +759,7 @@ async function refreshAll() {
   const cur = accounts.value.find(a => a.id === (scope.mode === 'single' ? scope.accountId : currentUser.value))
   if (cur && cur.seat_id) mySeatId.value = cur.seat_id
   await loadReserves()
+  loadSegTemplates()
   if (manual.roomId) loadSeats()
 }
 

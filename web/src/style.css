@@ -60,6 +60,17 @@ body {
 }
 .pill.active { border-color: #3b7cff; background: #eef4ff; color: #3b7cff; font-weight: 600; }
 
+/* 时间段模板：更紧凑的胶囊，点一下套用，右上角 × 删除 */
+.tpl-pill {
+  padding: 5px 12px; font-size: 12.5px; display: inline-flex; align-items: center; gap: 6px;
+  border-color: #dbe3f0; color: #46506a;
+}
+.tpl-pill:hover { border-color: #3b7cff; color: #3b7cff; background: #f6f9ff; }
+.tpl-pill .tpl-x {
+  font-weight: 700; color: #a8b1c2; font-size: 13px; line-height: 1; cursor: pointer;
+}
+.tpl-pill .tpl-x:hover { color: #e5484d; }
+
 .row { display: flex; gap: 12px; align-items: center; }
 .row > * { flex: 1; }
 .grow { flex: 1; }

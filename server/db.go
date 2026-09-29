@@ -32,9 +32,12 @@ type User struct {
 	WindowMode string `gorm:"size:8" json:"window_mode"` // 预约窗口开放日: prev=前一天(默认,如19:00抢明天) | same=当天早上(如07:00抢当天)
 	FullDay    bool   `json:"full_day"`                  // 一次性预约满一整天：直接约到闭馆时间（不用分段）
 	// ---- 模块6：非超星域名的学校（如中国农业大学图书馆 lib.cau.edu.cn/reserve）----
-	BaseURL     string    `gorm:"size:255" json:"base_url"`   // 自定义服务器地址；空=office.chaoxing.com
-	LoginMode   string    `gorm:"size:16" json:"login_mode"`  // passport(超星账号,默认) | tpass(校园统一认证)
-	SchoolClose string    `gorm:"size:8" json:"school_close"` // 该校系统真实闭馆时间（抓包识别，用于收紧房间时间）
+	BaseURL     string    `gorm:"size:255" json:"base_url"`    // 自定义服务器地址；空=office.chaoxing.com
+	LoginMode   string    `gorm:"size:16" json:"login_mode"`   // passport(超星账号,默认) | tpass(校园统一认证)
+	SchoolClose string    `gorm:"size:8" json:"school_close"`  // 该校系统真实闭馆时间（抓包识别，用于收紧房间时间）
+	AutoSeat    bool      `json:"auto_seat"`                   // 座位被占时自动改用本房间"这一时段确实空闲"的其他座位
+	MaxReserves int       `json:"max_reserves"`                // 该校允许"同时持有的预约总数"（使用中+未来）；0 = 不限制（一直约到学校拒绝）
+	PauseTimes  string    `gorm:"size:255" json:"pause_times"` // 禁约时段（午休/晚饭），如 "12:30-13:00,18:00-18:30"：排版时段尾不能跨进去
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -67,13 +70,15 @@ type Task struct {
 	Status          string    `gorm:"size:16;index" json:"status"` // active|paused|done|error
 	LastAction      string    `gorm:"type:text" json:"last_action"`
 	LastOK          bool      `json:"last_ok"`
-	ReserveID       int64     `json:"reserve_id"`               // 最近一次预约 id
-	ReserveEndAt    int64     `json:"reserve_end_at"`           // 最近预约结束毫秒时间戳
-	GrabMs          int64     `json:"grab_ms"`                  // 本轮放号首抢耗时（毫秒）
-	GrabAt          int64     `json:"grab_at"`                  // 本轮放号首抢到的时刻（毫秒时间戳）
-	GrabDay         string    `gorm:"size:16" json:"grab_day"`  // 上面这次"抢到"对应的目标日（同一轮放号只记首次）
-	Segments        string    `gorm:"size:512" json:"segments"` // 手动时间段任务：JSON [{"start":"08:00","end":"12:00"},...]
-	Username        string    `gorm:"-" json:"username"`        // 所属账号（联表展示）
+	ReserveID       int64     `json:"reserve_id"`                        // 最近一次预约 id
+	ReserveEndAt    int64     `json:"reserve_end_at"`                    // 最近预约结束毫秒时间戳
+	GrabMs          int64     `json:"grab_ms"`                           // 本轮放号首抢耗时（毫秒）
+	GrabAt          int64     `json:"grab_at"`                           // 本轮放号首抢到的时刻（毫秒时间戳）
+	GrabDay         string    `gorm:"size:16" json:"grab_day"`           // 上面这次"抢到"对应的目标日（同一轮放号只记首次）
+	Segments        string    `gorm:"size:512" json:"segments"`          // 手动时间段任务：JSON [{"start":"08:00","end":"12:00"},...]
+	SkipSegments    string    `gorm:"size:1024" json:"skip_segments"`    // 用户手动取消过的时段（JSON [{start,end}]）：不再自动补约，直到任务被"恢复"
+	WatchedSegments string    `gorm:"size:1024" json:"watched_segments"` // 上一次看到的"未来段"（用来发现"被取消"）
+	Username        string    `gorm:"-" json:"username"`                 // 所属账号（联表展示）
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -90,6 +95,15 @@ type QrCode struct {
 	UploadCount int       `json:"upload_count"` // 被使用/上传次数
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// SegmentTemplate 手动时间段模板（模块5）：把常用的一套时间段存下来，下次一键套用。
+type SegmentTemplate struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Name      string    `gorm:"size:64" json:"name"`      // 模板名，如「工作日三段」
+	Segments  string    `gorm:"size:512" json:"segments"` // JSON [{"start":"09:00","end":"13:00"},...]
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // fillSchool 若账号缺少学校参数，回填系统默认值（保留已配置的字段）。
@@ -146,6 +160,87 @@ func (u *User) schoolKey() string {
 type TimeSegment struct {
 	Start string `json:"start"`
 	End   string `json:"end"`
+}
+
+// TimeRange 一个绝对时段（用于记录"用户取消掉的预约段"）。
+type TimeRange struct {
+	Start int64 `json:"start"` // 毫秒时间戳
+	End   int64 `json:"end"`
+}
+
+// skipRanges 用户手动取消过的时段（不再自动补约）。
+func (t *Task) skipRanges() []TimeRange {
+	if strings.TrimSpace(t.SkipSegments) == "" {
+		return nil
+	}
+	var out []TimeRange
+	if err := json.Unmarshal([]byte(t.SkipSegments), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func encodeRanges(rs []TimeRange) string {
+	if len(rs) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(rs)
+	return string(b)
+}
+
+// WatchedSeg 上一次看到的"未来段"（起始时刻 + 座位号）。
+// 座位号决定"取消"的性质：取消本任务的座位 = 这个时间不要了；取消别的座位 = 只是不想坐那个座位，
+// 该时间仍可按任务座位重新约（见 Scheduler.syncCancelled）。
+type WatchedSeg struct {
+	Start int64  `json:"start"` // 毫秒时间戳
+	Seat  string `json:"seat,omitempty"`
+}
+
+// watchedList 上一次看到的"未来段"。
+func (t *Task) watchedList() []WatchedSeg {
+	if strings.TrimSpace(t.WatchedSegments) == "" {
+		return nil
+	}
+	var out []WatchedSeg
+	if err := json.Unmarshal([]byte(t.WatchedSegments), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func encodeWatched(ws []WatchedSeg) string {
+	if len(ws) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(ws)
+	return string(b)
+}
+
+// normSeat 座位号归一化（"070" == "70"），避免前导零被误判成两个不同座位。
+func normSeat(s string) string {
+	s = strings.TrimSpace(s)
+	if v := strings.TrimLeft(s, "0"); v != "" {
+		return v
+	}
+	if s == "" {
+		return ""
+	}
+	return "0"
+}
+
+// isTaskSeat 该座位号是否属于本任务的座位（含备选座位）。
+// 座位号未知（空）时保守返回 true（当作本任务座位，即"取消 = 这个时间不要了"）。
+func (t *Task) isTaskSeat(seat string) bool {
+	s := normSeat(seat)
+	if s == "" {
+		return true
+	}
+	for _, c := range t.seatCandidates() {
+		if normSeat(c) == s {
+			return true
+		}
+	}
+	return false
 }
 
 // NormalizeSegments 清洗手动时间段：去掉非法项、去重、按开始时间排序。
@@ -235,7 +330,7 @@ func OpenDB(cfg *AppConfig) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&User{}, &SessionToken{}, &Task{}, &QrCode{}); err != nil {
+	if err := db.AutoMigrate(&User{}, &SessionToken{}, &Task{}, &QrCode{}, &SegmentTemplate{}); err != nil {
 		return nil, err
 	}
 	return db, nil

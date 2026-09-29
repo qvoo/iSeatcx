@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -232,6 +233,31 @@ var (
 	reSubmitEnc = regexp.MustCompile(`(?i)id="submit_enc"\s+value="([^"]+)"`)
 )
 
+// ErrBlacklisted 学校把这个账号限制使用了（如"非法预约"，管理员拉黑）。
+// 遇到它再重试没有任何意义：继续撞接口只会让情况更糟，应当停下来人工处理。
+var ErrBlacklisted = errors.New("账号已被学校限制使用（非法预约）")
+
+// ErrSeatTaken 码页显示"该座位已被别人预约"（对方还没签到）。
+// 这不是故障，是这个座位暂时被占着 —— 要按"约不上"处理（换时段/换座位，等对方没签到被释放）。
+var ErrSeatTaken = errors.New("该座位已被别人预约（等待对方签到，未签到会自动释放）")
+
+// isSeatTakenPage 判断码页是不是"座位已被别人预约、等待对方签到"的提示页。
+func isSeatTakenPage(txt string) bool {
+	return strings.Contains(txt, "已被别人预约") || strings.Contains(txt, "等待用户签到中")
+}
+
+// isBlacklistPage 判断响应是不是学校的"限制使用"页面。
+// 典型内容：msg=您已被管理员限制使用&blackDays=永久&blackReason=非法预约
+func isBlacklistPage(txt string) bool {
+	if strings.Contains(txt, "非法预约") {
+		return true
+	}
+	if strings.Contains(txt, "已被管理员限制使用") {
+		return true
+	}
+	return strings.Contains(txt, "blackReason") && strings.Contains(txt, "限制使用")
+}
+
 // 大厅页面里的学校参数（各校页面都会内联这些变量）。
 var (
 	reCapMappID    = regexp.MustCompile(`(?i)mappId['"]?\s*[:=]\s*['"]?(\d+)`)
@@ -307,6 +333,13 @@ func (c *CXClient) FetchCodePage(roomID, seatNum, seatID string) (*CodePage, err
 		return nil, err
 	}
 	txt := string(body)
+	if isBlacklistPage(txt) {
+		return nil, ErrBlacklisted
+	}
+	if isSeatTakenPage(txt) {
+		// 座位被别人占着（对方还没签到）：拿不到 submit_enc 是正常的，按"约不上"处理
+		return nil, ErrSeatTaken
+	}
 	cp := &CodePage{RoomID: roomID, SeatNum: seatNum, SeatID: seatID}
 	if m := reRoomID.FindStringSubmatch(txt); len(m) == 2 {
 		cp.RoomID = m[1]
@@ -505,6 +538,7 @@ type SeatRule struct {
 	OpenFrom   string // 当天开馆时间
 	CloseAt    string // 当天闭馆时间
 	NumLimit   int    // 同时可持有的预约段数
+	Pauses     string // 禁约时段（午休/晚饭等），如 "12:30-13:00,18:00-18:30"：段尾不能跨进去
 }
 
 // String 便于日志/界面展示。
@@ -547,6 +581,7 @@ func (c *CXClient) FetchSeatRule(seatID string) (*SeatRule, error) {
 		} `json:"data"`
 		Success bool `json:"success"`
 	}
+
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, err
 	}
@@ -575,6 +610,33 @@ func (c *CXClient) FetchSeatRule(seatID string) (*SeatRule, error) {
 	if r.OpenTime == "" && !m.Success {
 		return nil, fmt.Errorf("该校座位配置读取失败: %s", truncate(string(body), 150))
 	}
+	// 禁约时段（午休/晚饭，如 12:30-13:00、18:00-18:30）：学校页面上这些格子点不动。
+	// 各星期各有一份，取并集（保守：宁可不排，也别提交了被拒）。
+	// 注意：只取"星期几 PauseTimes"，不要用 commonPauseTimes —— 后者是天级的大区间
+	// （含 11:30-14:00、21:30-24:00 等），会把正常可约时段也一起排掉。
+	var pauses []string
+	seenPause := map[string]bool{}
+	for _, d := range []string{"mon", "tues", "wed", "thur", "fri", "sat", "sun"} {
+		arr, ok := sc.CommonTimeConfig[d+"PauseTimes"].([]any)
+		if !ok {
+			continue
+		}
+		for _, it := range arr {
+			kv, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			st, _ := kv["startTime"].(string)
+			en, _ := kv["endTime"].(string)
+			if st == "" || en == "" || seenPause[st+"-"+en] {
+				continue
+			}
+			seenPause[st+"-"+en] = true
+			pauses = append(pauses, st+"-"+en)
+		}
+	}
+	sort.Strings(pauses)
+	r.Pauses = strings.Join(pauses, ",")
 	return r, nil
 }
 

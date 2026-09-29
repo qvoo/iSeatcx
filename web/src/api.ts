@@ -10,6 +10,14 @@ export interface Room {
   is_open: number
 }
 
+export interface SegmentTemplate {
+  id: number
+  name: string
+  segments: string // JSON: [{"start":"09:00","end":"13:00"},...]
+  created_at?: string
+  updated_at?: string
+}
+
 export interface Task {
   id: number
   user_id: number
@@ -34,6 +42,7 @@ export interface Task {
   grab_at: number
   grab_day?: string
   segments?: string
+  skip_segments?: string
   created_at: string
   updated_at: string
 }
@@ -81,6 +90,8 @@ export interface Account {
   base_url?: string
   login_mode?: string
   school_close?: string
+  auto_seat?: boolean
+  max_reserves?: number
   created_at?: string
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,19 +51,21 @@ func parseHallURL(link string) map[string]any {
 
 // schoolParamsReq 「学校参数 + 学校规则」的公共请求体（添加账号 / 修改学校规则共用）。
 type schoolParamsReq struct {
-	SeatID     string `json:"seat_id"`
-	DeptIDEnc  string `json:"dept_id_enc"`
-	SeatIDEnc  string `json:"seat_id_enc"`
-	CaptchaID  string `json:"captcha_id"`
-	OpenTime   string `json:"open_time"`
-	MaxHours   *int   `json:"max_hours"`
-	ApiStyle   string `json:"api_style"`
-	MappID     string `json:"mapp_id"`
-	HallURL    string `json:"hall_url"`
-	WindowMode string `json:"window_mode"`
-	FullDay    *bool  `json:"full_day"`
-	BaseURL    string `json:"base_url"`   // 自定义服务器地址（非 office 域名，如 http://lib.cau.edu.cn/reserve）
-	LoginMode  string `json:"login_mode"` // 登录方式: passport(超星账号,默认) | tpass(校园统一认证)
+	SeatID      string `json:"seat_id"`
+	DeptIDEnc   string `json:"dept_id_enc"`
+	SeatIDEnc   string `json:"seat_id_enc"`
+	CaptchaID   string `json:"captcha_id"`
+	OpenTime    string `json:"open_time"`
+	MaxHours    *int   `json:"max_hours"`
+	ApiStyle    string `json:"api_style"`
+	MappID      string `json:"mapp_id"`
+	HallURL     string `json:"hall_url"`
+	WindowMode  string `json:"window_mode"`
+	FullDay     *bool  `json:"full_day"`
+	AutoSeat    *bool  `json:"auto_seat"`    // 座位被占时自动换本房间空闲座位
+	MaxReserves *int   `json:"max_reserves"` // 该校允许同时持有的预约总数（使用中+未来）；0 = 不限制
+	BaseURL     string `json:"base_url"`     // 自定义服务器地址（非 office 域名，如 http://lib.cau.edu.cn/reserve）
+	LoginMode   string `json:"login_mode"`   // 登录方式: passport(超星账号,默认) | tpass(校园统一认证)
 }
 
 // guessBaseURL 从大厅链接推出该系统的服务器地址（含路径前缀）：
@@ -175,6 +178,10 @@ func (s *Server) applyRuleCapture(req schoolParamsReq, rule *SeatRule, updates m
 	// 该校真实闭馆时间（房间接口有时比学校实际允许的更宽，提交会被判"时间段不一致"）
 	if rule.CloseAt != "" {
 		updates["school_close"] = rule.CloseAt
+	}
+	// 禁约时段（午休/晚饭）：排版时不能跨进去，否则提交必被拒
+	if rule.Pauses != "" {
+		updates["pause_times"] = rule.Pauses
 	}
 }
 
@@ -343,7 +350,127 @@ func (s *Server) handleRooms(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"rooms": rooms, "day": day, "school": gin.H{"seat_id": target.SeatID, "dept_id_enc": target.DeptIDEnc, "captcha_id": target.CaptchaID}})
+	// 兜底：有些学校/院系的 room/list 按账号里的 deptIdEnc 查出来是空列表
+	// （粘贴的大厅链接里的 fidEnc 跟这个账号真正在用的院系不是同一个），
+	// 但"我的预约"里带着房间号 —— 用你约过的房间兜底，至少能继续选座下单。
+	fallback := false
+	if len(rooms) == 0 {
+		rooms = roomsFromMyReserves(cx, target.SeatID, day)
+		fallback = len(rooms) > 0
+	}
+	c.JSON(http.StatusOK, gin.H{"rooms": rooms, "day": day, "fallback": fallback,
+		"school": gin.H{"seat_id": target.SeatID, "dept_id_enc": target.DeptIDEnc, "captcha_id": target.CaptchaID}})
+}
+
+// roomsFromMyReserves 用"我的预约"里出现过的房间拼一个自习室列表（room/list 返回空时的兜底）。
+func roomsFromMyReserves(cx *CXClient, seatID, day string) []RoomItem {
+	cur, near, err := cx.MyReserves(seatID)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []RoomItem
+	for _, r := range append(append([]ReserveInfo{}, cur...), near...) {
+		id := r.RoomIDStr()
+		if id == "" || id == "0" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		t, _ := time.Parse("2006-01-02", day)
+		capEnd, openAt := "", ""
+		if !t.IsZero() {
+			capEnd, _ = cx.RoomCapEndAt(id, t)
+			openAt = cx.RoomOpenAt(id, t)
+		}
+		out = append(out, RoomItem{
+			ID: id, Name: strings.Trim(strings.Join([]string{r.First, r.Second, r.Third}, "-"), "-"),
+			Floor1: r.First, Floor2: r.Second, Floor3: r.Third,
+			CapEnd: capEnd, OpenTime: openAt, IsOpen: 1,
+		})
+	}
+	return out
+}
+
+// validateSegments 校验一套时间段：至少一段，且相邻段不能重叠
+// （同一账号同一时段重叠会被学校拒绝，之前是分散在两处各写一遍）。
+func validateSegments(segs []TimeSegment) error {
+	if len(segs) == 0 {
+		return errors.New("请至少填写一个时间段（HH:MM 起 ~ HH:MM 止，且开始早于结束）")
+	}
+	for i := 1; i < len(segs); i++ {
+		if segs[i].Start < segs[i-1].End {
+			return fmt.Errorf("时间段重叠：%s~%s 与 %s~%s", segs[i-1].Start, segs[i-1].End, segs[i].Start, segs[i].End)
+		}
+	}
+	return nil
+}
+
+// GET /api/seg-templates  时间段模板列表（模块5：手动选时间段用）。
+func (s *Server) handleSegTemplates(c *gin.Context) {
+	if _, ok := s.authUser(c); !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+	var list []SegmentTemplate
+	s.db.Order("id asc").Find(&list)
+	c.JSON(http.StatusOK, gin.H{"templates": list})
+}
+
+// POST /api/seg-templates  {name, segments:[{start,end}]}
+// 同名模板直接覆盖：改完时间段点一下「存为模板」就更新了，不会攒出一堆重复的。
+func (s *Server) handleSaveSegTemplate(c *gin.Context) {
+	if _, ok := s.authUser(c); !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+	var req struct {
+		Name     string        `json:"name"`
+		Segments []TimeSegment `json:"segments"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请填写模板名称"})
+		return
+	}
+	if len([]rune(name)) > 20 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "模板名称最多 20 个字"})
+		return
+	}
+	segs := NormalizeSegments(req.Segments)
+	if err := validateSegments(segs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	b, _ := json.Marshal(segs)
+	var tpl SegmentTemplate
+	if err := s.db.Where("name = ?", name).First(&tpl).Error; err == nil {
+		s.db.Model(&SegmentTemplate{}).Where("id = ?", tpl.ID).Updates(map[string]any{"segments": string(b)})
+		s.db.First(&tpl, tpl.ID)
+		c.JSON(http.StatusOK, gin.H{"template": tpl, "msg": "模板已更新"})
+		return
+	}
+	tpl = SegmentTemplate{Name: name, Segments: string(b)}
+	s.db.Create(&tpl)
+	c.JSON(http.StatusOK, gin.H{"template": tpl, "msg": "模板已保存"})
+}
+
+// DELETE /api/seg-templates/:id
+func (s *Server) handleDeleteSegTemplate(c *gin.Context) {
+	if _, ok := s.authUser(c); !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
+		return
+	}
+	id, _ := strconv.Atoi(c.Param("id"))
+	if id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+	s.db.Delete(&SegmentTemplate{}, id)
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // POST /api/tasks  创建占座任务
@@ -421,17 +548,9 @@ func (s *Server) handleCreateTask(c *gin.Context) {
 	segJSON := ""
 	if req.Type == "manual" {
 		segs := NormalizeSegments(req.Segments)
-		if len(segs) == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "请至少填写一个时间段（HH:MM 起 ~ HH:MM 止，且开始早于结束）"})
+		if err := validateSegments(segs); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
-		}
-		// 相邻段之间不能重叠（同一账号同一座位重叠会被学校拒绝）
-		for i := 1; i < len(segs); i++ {
-			if segs[i].Start < segs[i-1].End {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("时间段重叠：%s~%s 与 %s~%s",
-					segs[i-1].Start, segs[i-1].End, segs[i].Start, segs[i].End)})
-				return
-			}
 		}
 		b, _ := json.Marshal(segs)
 		segJSON = string(b)
@@ -509,7 +628,16 @@ func (s *Server) handleTaskAction(c *gin.Context) {
 		s.db.Save(&task)
 	case "resume":
 		task.Status = "active"
+		// 恢复 = 重新开始补约：清空"你手动取消过的时段"列表（取消过的段不再被跳过），
+		// 并让引擎立刻重新检测、马上把时间段补满（不必等下一个常规扫描周期）。
+		task.SkipSegments = ""
+		task.WatchedSegments = ""
+		task.LastAction = "已恢复，正在重新检测并补满时间段…"
+		task.LastOK = true
 		s.db.Save(&task)
+		if s.scheduler != nil {
+			s.scheduler.resumeTask(task.ID)
+		}
 	case "remove":
 		s.db.Delete(&task)
 	default:
@@ -691,6 +819,9 @@ func (s *Server) setupRouter() *gin.Engine {
 		api.POST("/tasks", s.handleCreateTask)
 		api.GET("/tasks", s.handleTasks)
 		api.POST("/tasks/:id/action", s.handleTaskAction)
+		api.GET("/seg-templates", s.handleSegTemplates)
+		api.POST("/seg-templates", s.handleSaveSegTemplate)
+		api.DELETE("/seg-templates/:id", s.handleDeleteSegTemplate)
 		api.GET("/my-reserves", s.handleMyReserves)
 		api.POST("/reserve-action", s.handleReserveAction)
 		api.GET("/accounts", s.handleAccounts)
@@ -752,6 +883,8 @@ func (s *Server) handleAccounts(c *gin.Context) {
 		BaseURL     string `json:"base_url"`
 		LoginMode   string `json:"login_mode"`
 		SchoolClose string `json:"school_close"`
+		AutoSeat    bool   `json:"auto_seat"`
+		MaxReserves int    `json:"max_reserves"`
 		CreatedAt   string `json:"created_at"`
 	}
 	out := make([]acc, 0, len(list))
@@ -759,7 +892,7 @@ func (s *Server) handleAccounts(c *gin.Context) {
 		u.fillSchool(s.cfg)
 		out = append(out, acc{ID: u.ID, Username: u.Username, SeatID: u.SeatID, DeptIDEnc: u.DeptIDEnc, SeatIDEnc: u.SeatIDEnc, CaptchaID: u.CaptchaID, School: u.SchoolString(),
 			OpenTime: u.OpenTime, MaxHours: u.MaxHours, ApiStyle: u.ApiStyle, MappID: u.MappID, HallURL: u.HallURL,
-			WindowMode: u.WindowMode, FullDay: u.FullDay, BaseURL: u.BaseURL, LoginMode: u.LoginMode, SchoolClose: u.SchoolClose,
+			WindowMode: u.WindowMode, FullDay: u.FullDay, BaseURL: u.BaseURL, LoginMode: u.LoginMode, SchoolClose: u.SchoolClose, AutoSeat: u.AutoSeat, MaxReserves: u.MaxReserves,
 			CreatedAt: u.CreatedAt.Format("2006-01-02 15:04")})
 	}
 	c.JSON(http.StatusOK, gin.H{"accounts": out})
@@ -954,6 +1087,17 @@ func (s *Server) handleAccountSchool(c *gin.Context) {
 	if req.FullDay != nil {
 		updates["full_day"] = *req.FullDay
 	}
+	if req.AutoSeat != nil {
+		updates["auto_seat"] = *req.AutoSeat
+	}
+	if req.MaxReserves != nil {
+		// 0 = 不限制（一直约到学校拒绝为止），最大 12 段防止误填
+		if *req.MaxReserves < 0 || *req.MaxReserves > 12 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "最多同时持有预约数应在 0~12 之间（0 = 不限制）"})
+			return
+		}
+		updates["max_reserves"] = *req.MaxReserves
+	}
 	if req.HallURL != "" {
 		updates["hall_url"] = req.HallURL
 		// 自动抓包：从大厅链接识别该校参数 + 放号规则（含页面里的 seatIdEnc / deptIdEnc / mappId 等）
@@ -982,7 +1126,7 @@ func (s *Server) handleAccountSchool(c *gin.Context) {
 		"seat_id_enc": nu.SeatIDEnc, "captcha_id": nu.CaptchaID, "school": nu.SchoolString(),
 		"open_time": nu.OpenTime, "max_hours": nu.MaxHours, "api_style": nu.ApiStyle,
 		"mapp_id": nu.MappID, "hall_url": nu.HallURL,
-		"window_mode": nu.WindowMode, "full_day": nu.FullDay,
+		"window_mode": nu.WindowMode, "full_day": nu.FullDay, "auto_seat": nu.AutoSeat, "max_reserves": nu.MaxReserves,
 		"base_url": nu.BaseURL, "login_mode": nu.LoginMode,
 	}})
 }
