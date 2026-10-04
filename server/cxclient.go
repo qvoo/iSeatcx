@@ -227,11 +227,28 @@ func (c *CXClient) Login(username, password string) error {
 }
 
 var (
-	reRoomID    = regexp.MustCompile(`(?i)var\s+roomId\s*=\s*['"]([0-9]+)['"]`)
-	reSeatNum   = regexp.MustCompile(`(?i)var\s+seatNum\s*=\s*['"](\d+)['"]`)
-	reSeatID    = regexp.MustCompile(`(?i)var\s+seatId\s*=\s*['"](\d+)['"]`)
-	reSubmitEnc = regexp.MustCompile(`(?i)id="submit_enc"\s+value="([^"]+)"`)
+	reRoomID  = regexp.MustCompile(`(?i)var\s+roomId\s*=\s*['"]([0-9]+)['"]`)
+	reSeatNum = regexp.MustCompile(`(?i)var\s+seatNum\s*=\s*['"](\d+)['"]`)
+	reSeatID  = regexp.MustCompile(`(?i)var\s+seatId\s*=\s*['"](\d+)['"]`)
+
+	// submit_enc 提取：兼容 id/name、单双引号、属性顺序任意，以及 JS 变量写法
+	reSubmitEncTag  = regexp.MustCompile(`(?is)<input[^>]*submit_enc[^>]*>`)
+	reSubmitEncAttr = regexp.MustCompile(`(?i)value\s*=\s*["']([^"']+)["']`)
+	reSubmitEncJS   = regexp.MustCompile(`(?i)submit_enc\s*[:=]\s*["']([^"']{4,})["']`)
 )
+
+// extractSubmitEnc 从码页 HTML 提取 submit_enc（兼容多种写法）。
+func extractSubmitEnc(txt string) string {
+	if tag := reSubmitEncTag.FindString(txt); tag != "" {
+		if m := reSubmitEncAttr.FindStringSubmatch(tag); len(m) == 2 {
+			return m[1]
+		}
+	}
+	if m := reSubmitEncJS.FindStringSubmatch(txt); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
 
 // ErrBlacklisted 学校把这个账号限制使用了（如"非法预约"，管理员拉黑）。
 // 遇到它再重试没有任何意义：继续撞接口只会让情况更糟，应当停下来人工处理。
@@ -350,10 +367,10 @@ func (c *CXClient) FetchCodePage(roomID, seatNum, seatID string) (*CodePage, err
 	if m := reSeatID.FindStringSubmatch(txt); len(m) == 2 {
 		cp.SeatID = m[1]
 	}
-	if m := reSubmitEnc.FindStringSubmatch(txt); len(m) == 2 {
-		cp.SubmitEnc = m[1]
+	if s := extractSubmitEnc(txt); s != "" {
+		cp.SubmitEnc = s
 	} else {
-		return nil, fmt.Errorf("页面未找到 submit_enc")
+		return nil, fmt.Errorf("页面未找到 submit_enc (页面片段: %s)", truncate(txt, 300))
 	}
 	return cp, nil
 }
